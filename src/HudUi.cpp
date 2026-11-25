@@ -503,14 +503,15 @@ void marqueeFit(Out &out, float x, float y, float size, float width,
   // 其中大半时间窗口里几乎没有字，看起来就像「半天不出来一个字」。
   const float overflow = textW + gap - width;
   const float holdMs = 1800.0f;  // 两端各停 1.8 秒
-  // 移动时长按 60 像素/秒估算，再钳到 [0.8 秒, 6 秒]：
-  // 只溢出一点点时也要看得清，溢出很多时也不能拖到让人以为卡住。
-  float moveMs = overflow / 0.06f;
-  if (moveMs < 800.0f) {
-    moveMs = 800.0f;
+  // 移动时长按 28 像素/秒估算，再钳到 [1.5 秒, 10 秒]。
+  // 玩家反馈 60 像素/秒偏快、字跟不上眼睛，这里整体放慢一档；
+  // 溢出很多的长标题也不能拖太久，所以给个上限。
+  float moveMs = overflow / 0.028f;
+  if (moveMs < 1500.0f) {
+    moveMs = 1500.0f;
   }
-  if (moveMs > 6000.0f) {
-    moveMs = 6000.0f;
+  if (moveMs > 10000.0f) {
+    moveMs = 10000.0f;
   }
   const float cycle = holdMs * 2.0f + moveMs;
   const float t = std::fmod(static_cast<float>(phaseMs % 10000000LL), cycle);
@@ -2804,7 +2805,8 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
       const float playW = 46.0f;
       const float gap = 3.0f;
       const float expandX = mTargetX + mTargetW - padL - expandW;
-      const float nextX = expandX - gap - btnW;
+      // 必须与绘制侧完全一致，否则按钮看得见点不中。
+      const float nextX = expandX - gap - btnW - (btnW + gap);
       const float playX = nextX - gap - playW;
       const float prevX = playX - gap - btnW;
       const float titleW = std::max(60.0f, prevX - padL - 12.0f);
@@ -3638,7 +3640,9 @@ bool HudUi::submit() {
     const float playW = 46.0f;
     const float gap = 3.0f;
     const float expandX = x + w - padL - expandW;
-    const float nextX = expandX - gap - btnW;
+    // 三大件整体再左移一个按钮位：原来下曲和放大键之间只隔 3 像素，
+    // 挤在一起既难看也容易误触。
+    const float nextX = expandX - gap - btnW - (btnW + gap);
     const float playX = nextX - gap - playW;
     const float prevX = playX - gap - btnW;
     const float titleW = std::max(60.0f, prevX - padL - 12.0f);
@@ -4953,8 +4957,11 @@ void HudUi::refresh(bool syncEngine) {
       // 否则长歌名在迷你条上不会触发滚动刷新。
       const bool bar = (mMode == Mode::Bar);
       const bool mini = (mMode == Mode::Mini);
-      const float titleSize = (bar ? 20.0f : (mini ? 27.0f : 30.0f)) * mFontScale;
-      const float avail = bar ? (mPanelW - 220.0f)
+      // 单行条的标题宽 = 面板宽 - 左边距12 - 右侧整串(放大40+间隙3+下曲40
+      // +让位43+间隙3+播放46+间隙3+上曲40) - 右留白12 - 中缝12 = 面板宽-254。
+      // 这个数必须跟着绘制侧一起改，否则会出现「判定放得下、实际被截断」。
+      const float titleSize = (bar ? 19.0f : (mini ? 27.0f : 30.0f)) * mFontScale;
+      const float avail = bar ? (mPanelW - 254.0f)
                               : (mini ? (mPanelW - 78.0f) : (mPanelW - 500.0f));
       const bool overflow = estimateTextWidth(mTitle, titleSize) * 1.03f > avail;
       mTitleScrolling.store(overflow);
@@ -4981,7 +4988,7 @@ void HudUi::refresh(bool syncEngine) {
     // 一旦那次提交耗时偏高（>12ms），间隔被拉到 33~50ms，
     // 整段动画就只剩 4~6 帧，看起来一格一格跳。
     // 标题超宽需要滚动时，250ms 一拍会让文字一顿一顿地跳。
-    long long forceInterval = mTitleScrolling.load() ? 50 : 250;
+    long long forceInterval = mTitleScrolling.load() ? 16 : 250;
     if (mAnimating) {
       forceInterval = 16;
     } else if (mDrag == Drag::List || mDrag == Drag::ScrollThumb ||
@@ -5008,6 +5015,12 @@ void HudUi::refresh(bool syncEngine) {
       // 即便某次提交很快，也没必要每帧重建整个面板。
       if (mMode == Mode::Expanded && forceInterval < 33) {
         forceInterval = 33;
+      }
+      // 标题正在滚动时位移要连续，中小面板统一提到 60fps。
+      // 大面板命令数多，保持上面的 33ms 下限，不然会掉帧。
+      if (mTitleScrolling.load() && mMode != Mode::Expanded &&
+          forceInterval > 16) {
+        forceInterval = 16;
       }
     }
     const long long beat = nowMs();
