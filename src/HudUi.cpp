@@ -502,16 +502,24 @@ void marqueeFit(Out &out, float x, float y, float size, float width,
   // 一个周期要 (textW + width + gap) / 65 像素每秒，长标题能到十几秒，
   // 其中大半时间窗口里几乎没有字，看起来就像「半天不出来一个字」。
   const float overflow = textW + gap - width;
-  const float speed = 0.07f;     // 70 像素/秒
   const float holdMs = 1800.0f;  // 两端各停 1.8 秒
-  const float moveMs = overflow / speed;
+  // 移动时长按 60 像素/秒估算，再钳到 [0.8 秒, 6 秒]：
+  // 只溢出一点点时也要看得清，溢出很多时也不能拖到让人以为卡住。
+  float moveMs = overflow / 0.06f;
+  if (moveMs < 800.0f) {
+    moveMs = 800.0f;
+  }
+  if (moveMs > 6000.0f) {
+    moveMs = 6000.0f;
+  }
   const float cycle = holdMs * 2.0f + moveMs;
   const float t = std::fmod(static_cast<float>(phaseMs % 10000000LL), cycle);
   float shift = 0.0f;
   if (t < holdMs) {
     shift = 0.0f;
   } else if (t < holdMs + moveMs) {
-    shift = -(t - holdMs) * speed;
+    // 匀速：总位移按时间比例分配，不受速度常量影响。
+    shift = -overflow * ((t - holdMs) / moveMs);
   } else {
     shift = -overflow;
   }
