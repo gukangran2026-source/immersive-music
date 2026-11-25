@@ -1,0 +1,33 @@
+# 构建产物
+build/
+*.o
+*.a
+*.so
+*.levipack
+
+# 第三方二进制：服务库不随仓库分发
+embed/
+reference/
+*.so.bak
+
+# 运行期数据（凭据、设置、日志）绝不上传
+data/
+session.json
+ui.json
+*.log
+build_stamp.txt
+
+# 账号与令牌类文件
+token*
+*token*.txt
+qr*.json
+qr*.txt
+wx*.json
+wx*.txt
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
