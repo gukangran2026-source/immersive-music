@@ -228,7 +228,7 @@ float estimateTextWidth(const std::string &text, float size) {
     } else {
       step = 4;
     }
-    width += (c < 0x80) ? size * 0.55f : size;
+    width += (c < 0x80) ? size * 0.62f : size;
     i += step;
   }
   return width;
@@ -256,7 +256,7 @@ std::string marqueeText(const std::string &text, float width, float size) {
     } else {
       step = 4;
     }
-    const float cw = (c < 0x80) ? size * 0.55f : size;
+    const float cw = (c < 0x80) ? size * 0.62f : size;
     if (used + cw > width) {
       break;
     }
@@ -450,7 +450,7 @@ void smoothMarquee(Out &out, float x, float y, float size, float width,
       } else {
         step = 4;
       }
-      const float cw = (c < 0x80) ? size * 0.55f : size;
+      const float cw = (c < 0x80) ? size * 0.62f : size;
       if (cursor >= 0.0f && cursor + cw <= width) {
         text(out, x + cursor, y, size, color, value.substr(i, step));
       }
@@ -469,9 +469,9 @@ void marqueeFit(Out &out, float x, float y, float size, float width,
     return;
   }
   const float textW = estimateTextWidth(value, size);
-  // 估算字宽与宿主真实字体宽度不完全一致。留 6% 安全边距，
+  // 估算字宽与真实字体宽度仍有一点点误差，留 3% 安全边距，
   // 宁可多滚一点，也不要出现「实际已经溢出、但判定成放得下所以不滚」。
-  if (textW * 1.06f <= width) {
+  if (textW * 1.03f <= width) {
     text(out, x, y, size, color, value);
     return;
   }
@@ -491,26 +491,33 @@ void marqueeFit(Out &out, float x, float y, float size, float width,
     }
     offsets.push_back(i);
     pixels.push_back(cursor);
-    cursor += (c < 0x80) ? size * 0.55f : size;
+    cursor += (c < 0x80) ? size * 0.62f : size;
     i += step;
   }
   const float gap = size * 2.5f;
-  const float span = textW + gap;
-  // 宿主没有裁剪能力，所以只提交完整落在宽度内的那段字符，
-  // 超出宽度的部分一个都不发，避免文字溢出行外。
+  // 标准跑马灯：先在原位停留（让人看清开头），再匀速左移，
+  // 末尾对齐后再停留，然后瞬回开头。
   //
-  // 方向：向右滚。
-  // 原来 drawX = x - (pixels[first] - shift)，shift 增大时 drawX 变小，
-  // 文字整体向左跑 —— 那就是"向左滚"的根源。
-  // 现在是向右：文字从左侧界外进场，向右推进，头先出右边界。
-  //   travel = 本帧已经滚过的总位移，从 -(textW+gap) 递增到 +width
-  //   每个字符的屏幕位置 = x + pixels[k] + travel
-  // 只用「完整落在 [x, x+width] 内」的字符，保证不越界。
-  const float speed = 0.065f;  // 65 像素/秒
-  const float travel = std::fmod((phaseMs % 1000000LL) * speed,
-                                 textW + width + gap) -
-                       (textW + gap);
-  const float startPx = x + travel;
+  // 旧实现是「整串从左侧界外滑入、穿过窗口、从右侧滑出」，
+  // 一个周期要 (textW + width + gap) / 65 像素每秒，长标题能到十几秒，
+  // 其中大半时间窗口里几乎没有字，看起来就像「半天不出来一个字」。
+  const float overflow = textW + gap - width;
+  const float speed = 0.07f;     // 70 像素/秒
+  const float holdMs = 1800.0f;  // 两端各停 1.8 秒
+  const float moveMs = overflow / speed;
+  const float cycle = holdMs * 2.0f + moveMs;
+  const float t = std::fmod(static_cast<float>(phaseMs % 10000000LL), cycle);
+  float shift = 0.0f;
+  if (t < holdMs) {
+    shift = 0.0f;
+  } else if (t < holdMs + moveMs) {
+    shift = -(t - holdMs) * speed;
+  } else {
+    shift = -overflow;
+  }
+  // 宿主没有裁剪能力，只能提交「完整落在窗口内」的连续字符段，
+  // 出界的部分一个都不发，避免文字溢出行外。
+  const float startPx = x + shift;
   std::size_t first = 0;
   // 跳过整体还在左界外的字符。
   while (first + 1 < pixels.size() &&
@@ -4941,7 +4948,7 @@ void HudUi::refresh(bool syncEngine) {
       const float titleSize = (bar ? 20.0f : (mini ? 27.0f : 30.0f)) * mFontScale;
       const float avail = bar ? (mPanelW - 220.0f)
                               : (mini ? (mPanelW - 78.0f) : (mPanelW - 500.0f));
-      const bool overflow = estimateTextWidth(mTitle, titleSize) * 1.06f > avail;
+      const bool overflow = estimateTextWidth(mTitle, titleSize) * 1.03f > avail;
       mTitleScrolling.store(overflow);
       if (overflow) {
         // 像素级滚动需要每拍重绘，不能按字符节拍跳。
