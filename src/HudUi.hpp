@@ -3,9 +3,9 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "MusicTypes.hpp"
@@ -54,7 +54,8 @@ public:
   void refresh(bool syncEngine);
   void processPending(AudioEngine &engine);
 
-  void applyConfig(const std::string &key, const std::string &value);
+  void applyConfig(const std::string &key, const std::string &value,
+                   bool immediate = false);
   bool autoPlayEnabled();
   bool uploadCover(const std::vector<unsigned char> &rgba, int width, int height);
   bool uploadCoverFrames(
@@ -356,7 +357,12 @@ private:
   // 如果无条件接受，磁盘里的设置会被默认值冲掉。
   std::atomic<bool> mConfigLoadedFromDisk{false};
   // 已经用磁盘值压过一次的开关键，后续玩家再改要放行。
-  std::set<std::string> mConfigApplied;
+  // 开关类回调的暂存队列：宿主回放是批量来的，玩家点击是单条的，
+  // 靠批量大小区分。见 applyConfig 里的说明。
+  std::unordered_map<std::string, std::string> mCfgPending;
+  long long mCfgPendingMs{0};
+  // 标题是否需要滚动：决定重绘节拍用 50ms 还是 250ms。
+  std::atomic<bool> mTitleScrolling{false};
   bool mShowCover{false};
   bool mShowProgress{true};
   float mFontScale{1.35f};

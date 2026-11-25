@@ -476,10 +476,10 @@ public:
       // 版本戳：每次启动写一次，用于确认当前加载的是哪一版模组。
       std::ofstream stamp(mDataDir + "/build_stamp.txt");
       if (stamp) {
-        stamp << "ui_version=35\nbuild=2026-11-25 05:45\n"
-                 "fix=modid_from_dirname,dark_theme_default,cover_toggle_fix,"
-                 "expanded_fixed_no_drag,modmenu_pos_removed,expanded_fps_cap,"
-                 "bar_compact\n";
+        stamp << "ui_version=36\nbuild=2026-11-25 11:15\n"
+                 "fix=modid_from_dirname,dark_theme_default,cover_toggle_batch,"
+                 "cover_switch_saved,bar_title_marquee,expanded_fixed_no_drag,"
+                 "modmenu_pos_removed,expanded_fps_cap,bar_compact\n";
       }
     }
 

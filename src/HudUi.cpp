@@ -469,7 +469,9 @@ void marqueeFit(Out &out, float x, float y, float size, float width,
     return;
   }
   const float textW = estimateTextWidth(value, size);
-  if (textW <= width) {
+  // 估算字宽与宿主真实字体宽度不完全一致。留 6% 安全边距，
+  // 宁可多滚一点，也不要出现「实际已经溢出、但判定成放得下所以不滚」。
+  if (textW * 1.06f <= width) {
     text(out, x, y, size, color, value);
     return;
   }
@@ -1442,50 +1444,26 @@ bool HudUi::install() {
   return true;
 }
 
-void HudUi::applyConfig(const std::string &key, const std::string &value) {
+void HudUi::applyConfig(const std::string &key, const std::string &value,
+                        bool immediate) {
   std::lock_guard<std::mutex> lock(mMutex);
   const bool truthy = (value == "true" || value == "1");
-  // 宿主在注册/打开菜单时，会用 defaultValue 回调一次 onConfigChanged。
-  // 如果无条件接受，磁盘里的设置每次重进都被打回默认。
-  // 只对「开关类」做拦截：滑块类（音量/位置）玩家随时会改，必须接受。
   const bool fromDisk = mConfigLoadedFromDisk.load();
   const bool isSwitch = (key == "showCover" || key == "showProgress" ||
                          key == "autoPlay" || key == "uploadListen");
-  // 宿主注册菜单时会用 defaultValue 回调一次 onConfigChanged，
-  // 不拦住就会把磁盘里的设置打回默认。但也不能一律拦住——
-  // 玩家第一次点开关时 mConfigApplied 里同样还没有这个 key，
-  // 原来的写法直接 return，表现就是「开关点了没反应」
-  // （玩家反馈「显示封面开了没用」就是这个）。
+  // 宿主在注册模块、打开菜单时，会把所有配置项按 defaultValue 连续回放一遍。
+  // 它和「玩家点了一下开关」走的是同一个回调，值也可能完全相同，单条无法区分。
   //
-  // 区分办法：只有传来的值「等于该配置项的默认值」才当成宿主回调忽略。
-  // 玩家操作必然传与默认值不同的值（或第二次以后同值），照常放行。
-  if (fromDisk && isSwitch && mConfigApplied.count(key) == 0) {
-    static const char *kDefaults[][2] = {
-        {"showCover", "false"},
-        {"showProgress", "true"},
-        {"autoPlay", "true"},
-        {"uploadListen", "true"},
-    };
-    std::string def;
-    for (const auto &pair : kDefaults) {
-      if (key == pair[0]) {
-        def = pair[1];
-        break;
-      }
-    }
-    if (!def.empty() && value == def) {
-      // 和默认值一致 → 这是宿主回放，忽略，保住磁盘里的值。
-      mConfigApplied.insert(key);
-      __android_log_print(ANDROID_LOG_INFO, kTag,
-                          "首次忽略宿主默认值 %s=%s（已用磁盘值）", key.c_str(),
-                          value.c_str());
-      return;
-    }
-    // 和默认值不同 → 一定是玩家改的，放行。
-    mConfigApplied.insert(key);
-    __android_log_print(ANDROID_LOG_INFO, kTag,
-                        "首次收到非默认值 %s=%s，按玩家操作处理", key.c_str(),
-                        value.c_str());
+  // 所以开关类一律先入队，等这一批回调停下来再判定：
+  //   一批 3 项以上 → 宿主回放，整批丢弃，保住磁盘里的值
+  //   只有 1 项      → 玩家操作，照常应用
+  //
+  // 旧实现按「该 key 是不是第一次出现」判断，第二次打开菜单时不再拦截，
+  // 宿主回放出来的默认值就把玩家设置冲掉了，表现就是「开关不记忆」。
+  if (!immediate && isSwitch && fromDisk) {
+    mCfgPending[key] = value;
+    mCfgPendingMs = nowMs();
+    return;
   }
   try {
     if (key == "showCover") {
@@ -4963,7 +4941,9 @@ void HudUi::refresh(bool syncEngine) {
       const float titleSize = (bar ? 20.0f : (mini ? 27.0f : 30.0f)) * mFontScale;
       const float avail = bar ? (mPanelW - 220.0f)
                               : (mini ? (mPanelW - 78.0f) : (mPanelW - 500.0f));
-      if (estimateTextWidth(mTitle, titleSize) > avail) {
+      const bool overflow = estimateTextWidth(mTitle, titleSize) * 1.06f > avail;
+      mTitleScrolling.store(overflow);
+      if (overflow) {
         // 像素级滚动需要每拍重绘，不能按字符节拍跳。
         mDirty = true;
       }
@@ -4985,7 +4965,8 @@ void HudUi::refresh(bool syncEngine) {
     // 原来没有这一条：200ms 的动画只被 16ms 的歌词节拍顺带推几下，
     // 一旦那次提交耗时偏高（>12ms），间隔被拉到 33~50ms，
     // 整段动画就只剩 4~6 帧，看起来一格一格跳。
-    long long forceInterval = 250;
+    // 标题超宽需要滚动时，250ms 一拍会让文字一顿一顿地跳。
+    long long forceInterval = mTitleScrolling.load() ? 50 : 250;
     if (mAnimating) {
       forceInterval = 16;
     } else if (mDrag == Drag::List || mDrag == Drag::ScrollThumb ||
@@ -5035,6 +5016,31 @@ void HudUi::refresh(bool syncEngine) {
 }
 
 void HudUi::processPending(AudioEngine &engine) {
+  // 结算 applyConfig 里入队的开关回调：见那里的说明。
+  {
+    std::unordered_map<std::string, std::string> pending;
+    bool burst = false;
+    {
+      std::lock_guard<std::mutex> lock(mMutex);
+      if (!mCfgPending.empty() && nowMs() - mCfgPendingMs > 200) {
+        pending.swap(mCfgPending);
+        burst = pending.size() >= 3;
+      }
+    }
+    if (!pending.empty()) {
+      if (burst) {
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+                            "配置: 判定为宿主回放 %zu 项, 整批忽略",
+                            pending.size());
+      } else {
+        for (const auto &kv : pending) {
+          __android_log_print(ANDROID_LOG_INFO, kTag, "配置: 玩家操作 %s=%s",
+                              kv.first.c_str(), kv.second.c_str());
+          applyConfig(kv.first, kv.second, true);
+        }
+      }
+    }
+  }
   // 弹键盘放在这里执行：工作线程，不在宿主触摸回调栈里。
   if (mWantKeyboard.exchange(0) != 0) {
     if (mShowKeyboard != nullptr) {
