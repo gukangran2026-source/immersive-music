@@ -15,6 +15,9 @@ namespace musicmod {
 // 它负责解析地址、串起播放、自动接续下一首。
 class AudioEngine {
 public:
+    // 播放模式：顺序、随机、单曲循环。
+  enum class PlayMode { Sequential, Shuffle, RepeatOne };
+
   explicit AudioEngine(JavaVM *vm) : mPlayer(vm) {}
 
   void setProvider(IMusicProvider *provider) { mProvider = provider; }
@@ -44,6 +47,16 @@ public:
   void togglePause();
   void next();
   void previous();
+  // 播放模式。cyclePlayMode() 按 顺序→随机→单曲循环→顺序 轮转。
+  PlayMode playMode() const { return mPlayMode; }
+  void setPlayMode(PlayMode mode);
+  void cyclePlayMode();
+  const char *playModeName() const;
+  // 自动接续（一首播完）。与手动 next() 的区别只有单曲循环：
+  // 自动接续时单曲循环要回到本曲，手动 next() 仍然切下一首。
+  void advanceAuto();
+  // 换歌单或大幅调整队列时重置随机历史。
+  void resetShuffleHistory();
   void stop();
   // 跳到指定毫秒位置。
   void seek(long long positionMs);
@@ -114,6 +127,17 @@ private:
   long long mLastSaveMs{0};
   std::chrono::steady_clock::time_point mPrepareDeadline;
   int mSilentTicks{0};
+  // 「位置不动」的宽容计数。缓冲抖一下不算播完，
+  // 连续 40 拍（约 6.4 秒）位置完全不动才判定卡死。
+  int mStallTicks{0};
+  // 播放模式，默认顺序播放。
+  PlayMode mPlayMode{PlayMode::Sequential};
+  // 随机模式用：已经播过的曲目下标。全部播完后清空重来，
+  // 避免纯随机在几十首里反复撞同几首。
+  std::vector<bool> mShuffleUsed;
+  // 随机顺序表：生成一次后按表走，这样「上一首」也能正确回溯。
+  std::vector<std::size_t> mShuffleOrder;
+  std::size_t mShufflePos{0};
 };
 
 } // namespace musicmod

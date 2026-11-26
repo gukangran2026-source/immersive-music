@@ -3,6 +3,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -24,6 +25,55 @@ public:
   ~HudUi();
   void setEngine(AudioEngine *engine);
   void setSearchHandler(std::function<void(const std::string &)> handler);
+  // 收藏切换回调。参数是当前曲目的 hash；由 main 去调酷狗接口。
+  // 走回调而不是在 HudUi 里直接调 KugouProvider：
+  // HudUi 只认引擎，不认具体音源，这条边界不能破。
+  void setFavoriteToggleHandler(std::function<void(const std::string &)> handler);
+  // 收藏结果回填：成功与否、是否已收藏、提示文字。
+  void setFavoriteState(bool favorited, const std::string &trackId);
+  // 取出一次「查询收藏状态」请求，返回要查的 hash，空表示没有请求。
+  std::string takeFavoriteQuery();
+  // 取出一次「重新拉收藏列表」请求。非 0 表示要拉。
+  int takeFavoriteListRequest() { return mFavoriteListRequest.exchange(0); }
+  // 填入收藏页第一层的歌单列表（由 main 调用）。
+  void setFavoritePlaylists(const std::vector<PlaylistInfo> &list);
+  // 取出一次「打开某个歌单」的请求，返回 listid，空表示没有。
+  std::string takeOpenPlaylistRequest();
+  // 进入某个歌单的第二层（main 拉到曲目后调用，同时把曲目塞进列表）。
+  void enterFavoritePlaylist(const std::string &id, const std::string &name);
+  // 退回歌单列表（第一层）。
+  void exitFavoritePlaylist();
+  // 已持锁版本：调用方必须已持有 mMutex（触摸路径专用）。
+  void exitFavoritePlaylistLocked();
+  // ---- 搜索分类 ----
+  void setSearchAlbums(const std::vector<AlbumInfo> &list);
+  void setSearchArtists(const std::vector<ArtistInfo> &list);
+  int searchKind() const { return mSearchKind; }
+  // ---- 歌手主页 ----
+  // 进入歌手页（main 拉到资料后调用，同时把歌曲塞进列表）。
+  void enterArtist(const ArtistInfo &artist);
+  // 退出歌手页。
+  void exitArtist();
+  // 已持锁版本：调用方必须已持有 mMutex（触摸路径专用）。
+  void exitArtistLocked();
+  bool inArtistView() const { return mArtistView != 0; }
+  void setArtistAlbums(const std::vector<AlbumInfo> &list);
+  // 取出一次歌手页加载请求：1=歌曲 2=专辑，0=无。
+  int takeArtistLoadRequest() { return mArtistLoadRequest.exchange(0); }
+  // 取出一次「打开专辑」请求。
+  std::string takeOpenAlbumRequest();
+  // 待加载的歌手 id（不消费，只读）。
+  const std::string &pendingArtistId() const { return mPendingArtistId; }
+  // 是否还需要拉歌手资料：名字为空或头像为空时算需要。
+  bool needArtistDetail() const {
+    return mArtistInfo.name.empty() || mArtistInfo.avatar.empty();
+  }
+  // 资料拉回来后回填（只更新名字/头像/计数，不动 id）。
+  void updateArtistInfo(const ArtistInfo &info);
+  bool artistSortByTime() const { return mArtistSortByTime; }
+  // 开关当前曲目的收藏。内部走 mFavoriteToggleHandler，联网在锁外。
+  void toggleFavoriteOnCurrent();
+  bool currentFavorited() const { return mTrackFavorited; }
   void setLoginHandler(std::function<void()> handler);
   void setLoginSendHandler(std::function<void()> handler);
   void setLoginSubmitHandler(std::function<void()> handler);
@@ -64,6 +114,21 @@ public:
   const std::string &coverId() const;
   void setLyric(const std::string &trackId, const std::string &text);
   void clearCover();
+  // 换歌时必须立刻清空旧歌词。
+  // 歌词是异步拉回来的（网络最长十几秒），不清的话新歌在唱、
+  // 界面还在滚上一首的词，看起来就是「歌和词对不上」。
+  void clearLyric();
+  // 封面现场记录。写文件而不是只打 logcat —— logcat 会被别的进程刷掉。
+  // 排查「有些歌封面不换」时全靠这份记录。
+  void setCoverLogPath(const std::string &path);
+  // 追加一行记录。线程安全，可以从中控线程和渲染线程同时调用。
+  void coverLog(const char *fmt, ...);
+  // 右上角圆形头像。走独立的图片 id，与封面互不覆盖。
+  bool uploadAvatar(const std::vector<unsigned char> &rgba, int width,
+                    int height);
+  const std::string &avatarId() const;
+  // 退出登录后清掉头像，下次登录重新拉取。
+  void clearAvatar();
   // 清掉二维码，界面显示“通道不可用”。
   void clearQr();
   // 扫码登录用的二维码图片与提示文字。
@@ -126,7 +191,9 @@ private:
   // Bar     = 620x64 单行迷你条（最小形态，替代圆球）
   enum class Mode { Mini, Expanded, Ball, Bar };
   // 底部三个一级入口：搜索、推荐、我的。
-  enum class Tab { Search, Recommend, Mine };
+  // Favorites 追加在末尾（索引 3），显示顺序由底部菜单单独排：
+  // 搜索、推荐、收藏、我的。这样不动 Mine 的索引，风险最小。
+  enum class Tab { Search, Recommend, Mine, Favorites };
   enum class Drag { None, Panel, Progress, List, ScrollThumb, Volume, AlphaSlider };
 
   enum PendingAction : int {
@@ -226,6 +293,25 @@ private:
   float mAlphaBar{-1.0f};
 
  public:
+  // 列表区上沿。绘制与触摸必须共用这一个函数，否则必然错位。
+  // 历史坑：歌手页绘制用 y+104、触摸用 y+140，差 36px，表现为「点哪都不对」。
+  float listTopFor() const {
+    if (mArtistView == 1) {
+      // 歌手页：返回键 y+70~98，子标签 y+100~130，列表从 y+140 起。
+      return mTargetY + 140.0f;
+    }
+    if (mTab == Tab::Search) {
+      return mTargetY + (searchHasQuery() ? 134.0f : 104.0f);
+    }
+    return mTargetY + 104.0f;
+  }
+  // 搜索页是否已经搜过东西（输入框非空，或有任一分类的结果）。
+  bool searchHasQuery() const {
+    if (!mInputText.empty()) {
+      return true;
+    }
+    return mTrackCount > 0 || !mSearchAlbums.empty() || !mSearchArtists.empty();
+  }
   // 取实际生效的透明度：未单独设置时回落到 mPanelAlpha。
   float effMiniAlpha() const {
     return mAlphaMini >= 0.0f ? mAlphaMini : mPanelAlpha;
@@ -448,8 +534,18 @@ private:
   std::size_t mCoverHash{0};
   std::string mCoverId{"musicmod.cover"};
   std::vector<std::string> mCoverIds;
+  // 已经成功注册进游戏层的图片 id。
+  // 游戏层不接受重复注册同名 id（第二次必返回 false），但图还在里面。
+  // 有这份记录才能分辨「已存在」和「真的失败」。
+  std::set<std::string> mRegisteredImages;
   long long mCoverRotationMs{0};
   long long mLastCoverTickMs{0};
+  // 右上角圆形头像的状态，与封面完全独立。
+  bool mAvatarReady{false};
+  int mAvatarW{0};
+  int mAvatarH{0};
+  std::size_t mAvatarHash{0};
+  std::string mAvatarImg{"musicmod.avatar"};
   struct LyricLine {
     long long timeMs{0};
     long long durationMs{0};
@@ -464,7 +560,52 @@ private:
   };
   std::vector<LyricLine> mLyrics;
   std::string mLyricTrackId;
+  // 封面现场记录的目标文件与保护锁。
+  std::string mCoverLogPath;
+  std::mutex mCoverLogMutex;
   std::size_t mCurrentLyric{0};
+  // 当前曲目是否已收藏，以及它对应的 hash。
+  // 带上 hash 是为了防止「切歌时旧结果晚到」把新歌错误标成已收藏。
+  bool mTrackFavorited{false};
+  std::string mFavoriteTrackId;
+  std::function<void(const std::string &)> mFavoriteToggleHandler;
+  // 有非 0 表示需要向音源查询当前曲目的收藏状态。
+  std::atomic<int> mFavoriteQueryPending{0};
+  // 有非 0 表示需要重新拉取「收藏」页列表。
+  std::atomic<int> mFavoriteListRequest{0};
+  // 收藏页当前层级：0=歌单列表，1=某歌单的歌曲列表。
+  int mFavView{0};
+  // 收藏页第一层的数据（歌单摘要）。
+  std::vector<PlaylistInfo> mFavPlaylists;
+  // 当前打开的歌单 id 与名字，供第二层页头显示。
+  std::string mFavOpenId;
+  std::string mFavOpenName;
+  // 点击歌单时写这里，由 main 去拉曲目。
+  std::string mPendingOpenPlaylist;
+  // ---- 搜索分类 ----
+  // 0=单曲 1=专辑 2=歌手。默认单曲。
+  int mSearchKind{0};
+  // 搜索结果缓存（专辑/歌手）。歌曲走 mTrackTitles 那一套。
+  std::vector<AlbumInfo> mSearchAlbums;
+  std::vector<ArtistInfo> mSearchArtists;
+  // ---- 歌手主页 ----
+  // 0=不在歌手页 1=歌手页
+  int mArtistView{0};
+  // 歌手页当前子标签：0=单曲 1=专辑。
+  int mArtistTab{0};
+  // 排序：false=按热度 true=按时间。
+  bool mArtistSortByTime{false};
+  // 当前歌手。
+  // 注意：不能叫 mArtist —— 那个名字已经被「当前歌曲的歌手名」占用。
+  ArtistInfo mArtistInfo;
+  // 歌手页的专辑缓存。
+  std::vector<AlbumInfo> mArtistAlbums;
+  // 待加载请求（由 main 消费）。
+  std::string mPendingArtistId;
+  // 1=要拉歌手歌曲 2=要拉歌手专辑
+  std::atomic<int> mArtistLoadRequest{0};
+  // 待打开的专辑 id（从歌手页点专辑进去）。
+  std::string mPendingAlbumId;
   // 切句时间戳：供歌词滚动做补间，避免切句瞬间跳一行。
   long long mLyricSwitchMs{0};
   // 面板透明度，0.0–1.0；可在「我的」页调节，写入 ui.json。

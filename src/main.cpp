@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -227,7 +228,7 @@ bool decodeCover(JavaVM *vm, const std::string &path,
 // 所以去掉了角度旋转，只保留圆角裁切。
 std::vector<std::vector<unsigned char>> makeRoundedCoverFrames(
     const std::vector<unsigned char> &src, int width, int height, int outSize,
-    int frameCount) {
+    int frameCount, float cornerRatio = 0.28f) {
   std::vector<std::vector<unsigned char>> frames;
   if (src.empty() || width <= 0 || height <= 0 || outSize <= 0 ||
       frameCount <= 0) {
@@ -239,7 +240,8 @@ std::vector<std::vector<unsigned char>> makeRoundedCoverFrames(
   // 圆角半径：边长的 28%。
   // 原来 18% 在 128px 输出上只有 23px 圆角，缩放到 220px 显示后
   // 圆角被插值抹平，看起来接近方块。现在同时加大半径和输出分辨率。
-  const float corner = static_cast<float>(outSize) * 0.28f;
+  // 圆角半径比例：封面用 0.28，头像传 0.5（正好是正圆的半径）。
+  const float corner = static_cast<float>(outSize) * cornerRatio;
   frames.reserve(frameCount);
   for (int frame = 0; frame < frameCount; ++frame) {
     std::vector<unsigned char> out(
@@ -476,11 +478,19 @@ public:
       // 版本戳：每次启动写一次，用于确认当前加载的是哪一版模组。
       std::ofstream stamp(mDataDir + "/build_stamp.txt");
       if (stamp) {
-        stamp << "ui_version=38\nbuild=2026-11-25 19:50\n"
+        stamp << "ui_version=55\nbuild=2026-11-26 17:05\n"
                  "fix=modid_from_dirname,dark_theme_default,cover_toggle_batch,"
                  "cover_switch_saved,marquee_slow_smooth,ascii_width_062,"
                  "bar_3btn_shift,expanded_fixed_no_drag,modmenu_pos_removed,"
-                 "expanded_fps_cap,bar_compact\n";
+                 "expanded_fps_cap,bar_compact,avatar_circle_real,"
+                 "logout_gate_relaxed,dup_avatar_removed,confirm_escape,"
+                 "avatar_thread_nonblock,playmode_shuffle_repeat,"
+                 "favorite_kugou_cloud,favorites_tab,tabs4,"
+                 "lyric_two_segment_front,playlist_picker,search_kinds,"
+                 "artist_page,sort_toggle,list_top_unified,"
+                 "search_kind_gated,bar_btns_right40,queue_empty_guard,"
+                 "skip_jitter_guard,empty_playlist_ok,isdef_default,"
+                 "fav_fileids_del,playlist_pagesize_fix,exp_btn_order,fix_back_deadlock,fav_status_data,no_playlist_drift,cover_lyric_guard,restore_mini,bar_no_mode_btn,lyric_engine_guard,lyric_thread_clear,remove_fav_status,mixsongid_field,mini_heart_btn,cover_thread_retry,cover_img_validate,mode_btn_flat,cover_debug_log,mode_btn_align,cover_id_reuse\n";
       }
     }
 
@@ -660,17 +670,57 @@ public:
     mUi.setTabChangeHandler([this](int tab) {
       const musicmod::Track *cur = mEngine->currentTrack();
       const std::string currentId = cur != nullptr ? cur->id : std::string();
+      // 列表为空时只换显示，不动播放队列。
+      // 没搜过的搜索页、还没拉到的推荐子页都属于这种，拿空列表去替换
+      // 会把正在播的歌弄没（历史上就是这样把队列清空的）。
       if (tab == 0) {
         mUi.setListTracks(mSearchList);
-        mEngine->setQueueKeepCurrent(mSearchList, currentId);
+        if (!mSearchList.empty()) {
+          mEngine->setQueueKeepCurrent(mSearchList, currentId);
+        }
       } else if (tab == 1) {
         const int sub = std::max(0, std::min(2, mUi.currentRecTab()));
         const std::vector<musicmod::Track> &list = mRecCache[sub];
         mUi.setListTracks(list);
-        mEngine->setQueueKeepCurrent(list, currentId);
+        if (!list.empty()) {
+          mEngine->setQueueKeepCurrent(list, currentId);
+        }
       }
     });
     // 点列表行才真正替换播放队列并播放。
+    // 收藏切换：点爱心时调用，联网在 main 线程里做（玩家主动操作，
+    // 一次性等待可接受），结果回填给 UI。
+    mUi.setFavoriteToggleHandler([this](const std::string &trackId) {
+      if (mKugou == nullptr || trackId.empty()) {
+        return;
+      }
+      if (!mKugou->loggedIn()) {
+        mUi.notify("请先登录", 3000);
+        return;
+      }
+      // 找到当前曲目，收藏接口要 title/albumId/audioId。
+      const musicmod::Track *cur = mEngine ? mEngine->currentTrack() : nullptr;
+      if (cur == nullptr || cur->id != trackId) {
+        mUi.notify("曲目已切换, 请重试", 3000);
+        return;
+      }
+      const bool wasFav = mUi.currentFavorited();
+      const bool ok = wasFav ? mKugou->removeFromFavorites(*cur)
+                             : mKugou->addToFavorites(*cur);
+      if (ok) {
+        mUi.setFavoriteState(!wasFav, trackId);
+        mUi.notify(wasFav ? "已取消收藏" : "已收藏到我喜欢", 2600);
+        __android_log_print(ANDROID_LOG_INFO, kTag, "收藏切换成功 新状态=%d",
+                            wasFav ? 0 : 1);
+        // 收藏变化会影响收藏页内容，标记一下，切过去时会重新拉。
+        mFavListDirty = true;
+      } else {
+        mUi.notify("操作失败: " + mKugou->lastError(), 4000);
+        __android_log_print(ANDROID_LOG_WARN, kTag, "收藏切换失败: %s",
+                            mKugou->lastError().c_str());
+      }
+    });
+
     mUi.setTrackSelectHandler([this](int index, int tab) {
       (void)tab;
       const std::vector<musicmod::Track> &list = mUi.shownTracks();
@@ -684,6 +734,24 @@ public:
     try {
       mWorker = std::thread([this] { run(); });
       __android_log_print(ANDROID_LOG_INFO, kTag, "步骤: 工作线程已启动");
+      // 头像抓取独立成线程：网络阻塞只影响它自己，主循环始终 16ms 稳定。
+      mAvatarStop.store(false);
+      mAvatarWorker = std::thread([this] { avatarLoop(); });
+      __android_log_print(ANDROID_LOG_INFO, kTag, "步骤: 头像线程已启动");
+      // 歌词也独立成线程。lyric() 内部是阻塞 httpGet（超时 12 秒，
+      // 失败还会再去掉 keywords 重试一次），绝不能再放主循环里。
+      mLyricStop.store(false);
+      mLyricWorker = std::thread([this] { lyricLoop(); });
+      __android_log_print(ANDROID_LOG_INFO, kTag, "步骤: 歌词线程已启动");
+      // 封面下载同样独立成线程。fetchCover 内部是 8s + 10s 两次阻塞请求，
+      // 放主循环里最坏卡 18 秒，且失败后旧代码不重试，封面就永久不换。
+      // 封面现场记录落到数据目录，不受 logcat 环形缓冲影响。
+      mUi.setCoverLogPath(mDataDir + "/cover_debug.log");
+      __android_log_print(ANDROID_LOG_INFO, kTag, "封面记录文件: %s",
+                          (mDataDir + "/cover_debug.log").c_str());
+      mCoverStop.store(false);
+      mCoverWorker = std::thread([this] { coverLoop(); });
+      __android_log_print(ANDROID_LOG_INFO, kTag, "步骤: 封面线程已启动");
     } catch (const std::system_error &e) {
       mRunning.store(false);
       __android_log_print(ANDROID_LOG_ERROR, kTag, "线程创建失败: %s", e.what());
@@ -728,6 +796,20 @@ private:
     mExitCv.notify_all();
     if (mWorker.joinable()) {
       mWorker.join();
+    }
+    // 头像线程必须在卸载前收掉，否则它会持有已销毁的 mKugou。
+    mAvatarStop.store(true);
+    if (mAvatarWorker.joinable()) {
+      mAvatarWorker.join();
+    }
+    // 歌词线程同样要在 mKugou 被销毁前收掉。
+    mLyricStop.store(true);
+    if (mLyricWorker.joinable()) {
+      mLyricWorker.join();
+    }
+    mCoverStop.store(true);
+    if (mCoverWorker.joinable()) {
+      mCoverWorker.join();
     }
   }
 
@@ -923,45 +1005,40 @@ private:
         if (!playError.empty()) {
           mUi.notify(playError, 4000);
         }
+        // 歌词：主循环只负责「告诉线程该拉哪首」和「把结果放到界面上」，
+        // 真正的网络请求在 lyricLoop() 线程里做。
+        // 原来这里直接调 mKugou->lyric()，那是阻塞调用（超时 12 秒，
+        // 失败还会再试一次），阻塞期间 mPositionMs 不推进，歌词行号就卡住不动。
         const musicmod::Track *lyricTrack = mEngine->currentTrack();
-        if (lyricTrack != nullptr) {
-          const long long nowMs2 =
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now().time_since_epoch())
-                  .count();
-          // 换歌：重置重试状态。
-          if (lyricTrack->id != mLastLyricId) {
-            mLastLyricId = lyricTrack->id;
-            mLyricTryCount = 0;
-            mNextLyricTryMs = 0;
-            mLyricGot = false;
+        if (lyricTrack != nullptr && lyricTrack->id != mLastLyricId) {
+          mLastLyricId = lyricTrack->id;
+          // 先清掉旧词：宁可空白，也不能拿上一首的词配这一首。
+          mUi.clearLyric();
+          {
+            std::lock_guard<std::mutex> lock(mLyricMutex);
+            mLyricReqTrack = *lyricTrack;
+            mLyricReqId = lyricTrack->id;
           }
-          // 还没拿到歌词，且到了该试的时间，就再试一次。
-          const bool needTry = !mLyricGot && mLyricTryCount < 3 &&
-                               (mNextLyricTryMs == 0 || nowMs2 >= mNextLyricTryMs);
-          if (needTry) {
-            ++mLyricTryCount;
-            const std::string text =
-                mKugou != nullptr ? mKugou->lyric(*lyricTrack) : std::string();
-            if (!text.empty()) {
-              mUi.setLyric(lyricTrack->id, text);
-              mLyricGot = true;
-              __android_log_print(ANDROID_LOG_INFO, kTag,
-                                  "歌词已获取 第%d次尝试 %.16s",
-                                  mLyricTryCount, lyricTrack->id.c_str());
-            } else {
-              // 退避：第 1 次失败等 3s，第 2 次失败等 8s，第 3 次失败等 20s。
-              const long long backoffMs =
-                  (mLyricTryCount == 1) ? 3000
-                                        : (mLyricTryCount == 2 ? 8000 : 20000);
-              mNextLyricTryMs = nowMs2 + backoffMs;
-              __android_log_print(ANDROID_LOG_WARN, kTag,
-                                  "歌词为空 第%d次尝试 %.16s 下次重试 %lldms后",
-                                  mLyricTryCount, lyricTrack->id.c_str(),
-                                  backoffMs);
+          __android_log_print(ANDROID_LOG_INFO, kTag, "换歌 请求歌词 %.16s",
+                              lyricTrack->id.c_str());
+        }
+        {
+          std::string readyId;
+          std::string readyText;
+          {
+            std::lock_guard<std::mutex> lock(mLyricMutex);
+            if (mLyricHasResult) {
+              readyId = mLyricReadyId;
+              readyText = mLyricReadyText;
+              mLyricHasResult = false;
             }
           }
+          if (!readyText.empty()) {
+            // setLyric 内部还会用引擎当前曲目再校验一次，双保险。
+            mUi.setLyric(readyId, readyText);
+          }
         }
+
         if (mEngine->takeNeedMore()) {
           const musicmod::Track *seed = mEngine->currentTrack();
           bool appended = false;
@@ -1017,12 +1094,119 @@ private:
           }
         }
         refreshCover();
+        refreshAvatar();
+        // 切歌后查一次收藏状态。只在曲目真的换了时才发起（UI 侧置的标志），
+        // 不是每拍都查。
+        const std::string favQuery = mUi.takeFavoriteQuery();
+        if (!favQuery.empty() && mKugou != nullptr && mKugou->loggedIn()) {
+          const musicmod::Track *cur = mEngine->currentTrack();
+          if (cur != nullptr && cur->id == favQuery) {
+            const bool fav = mKugou->isFavorite(*cur);
+            mUi.setFavoriteState(fav, favQuery);
+          }
+        }
+        // 进收藏页时重新拉歌单列表（第一层）。
+        // 收藏页不做缓存：玩家刚点过爱心，切过来必须看到最新结果。
+        if (mUi.takeFavoriteListRequest() != 0 && mKugou != nullptr &&
+            mKugou->loggedIn()) {
+          if (mKugou->loadPlaylists()) {
+            mUi.setFavoritePlaylists(mKugou->playlists());
+            __android_log_print(ANDROID_LOG_INFO, kTag, "收藏页歌单 %zu 个",
+                                mKugou->playlists().size());
+          } else {
+            mUi.setFavoritePlaylists({});
+            __android_log_print(ANDROID_LOG_INFO, kTag, "歌单列表为空: %s",
+                                mKugou->lastError().c_str());
+          }
+        }
+        // ---- 歌手页加载 ----
+        const int artistReq = mUi.takeArtistLoadRequest();
+        if (artistReq != 0 && mKugou != nullptr && mKugou->loggedIn()) {
+          const std::string aid = mUi.pendingArtistId();
+          if (!aid.empty()) {
+            // 资料只在第一次进歌手页时拉；切排序不重复拉资料。
+            if (mUi.needArtistDetail()) {
+              mKugou->loadArtistDetail(aid);
+              mUi.updateArtistInfo(mKugou->currentArtist());
+            }
+            const std::string sortBy = mUi.artistSortByTime() ? "new" : "hot";
+            if (artistReq == 2) {
+              if (mKugou->loadArtistAlbums(aid, sortBy)) {
+                mUi.setArtistAlbums(mKugou->albums());
+              } else {
+                mUi.notify("歌手专辑加载失败", 3000);
+                __android_log_print(ANDROID_LOG_WARN, kTag,
+                                    "歌手专辑加载失败: %s",
+                                    mKugou->lastError().c_str());
+              }
+            } else {
+              if (mKugou->loadArtistSongs(aid, sortBy)) {
+                const std::vector<musicmod::Track> songs = mKugou->tracks();
+                mUi.setListTracks(songs);
+                __android_log_print(ANDROID_LOG_INFO, kTag,
+                                    "歌手歌曲已加载 %zu 首", songs.size());
+              } else {
+                mUi.notify("歌手歌曲加载失败", 3000);
+                __android_log_print(ANDROID_LOG_WARN, kTag,
+                                    "歌手歌曲加载失败: %s",
+                                    mKugou->lastError().c_str());
+              }
+            }
+          }
+        }
+        // ---- 打开专辑 ----
+        const std::string openAlbum = mUi.takeOpenAlbumRequest();
+        if (!openAlbum.empty() && mKugou != nullptr && mKugou->loggedIn()) {
+          if (mKugou->loadAlbumSongs(openAlbum)) {
+            const std::vector<musicmod::Track> songs = mKugou->tracks();
+            mUi.setListTracks(songs);
+            mEngine->setQueue(songs);
+            mUi.notify("已载入专辑 " + std::to_string(songs.size()) + " 首",
+                       2600);
+            __android_log_print(ANDROID_LOG_INFO, kTag, "专辑已载入 %zu 首",
+                                songs.size());
+          } else {
+            mUi.notify("专辑加载失败: " + mKugou->lastError(), 4000);
+          }
+        }
+        // 点了某个歌单：拉它的曲目，然后进第二层。
+        const std::string openId = mUi.takeOpenPlaylistRequest();
+        if (!openId.empty() && mKugou != nullptr && mKugou->loggedIn()) {
+          if (mKugou->loadPlaylistTracks(openId)) {
+            const std::vector<musicmod::Track> songs = mKugou->tracks();
+            mFavoriteList = songs;
+            mUi.setListTracks(songs);
+            // 不要用「正在浏览的歌单」当收藏目标。
+            // 玩家打开某个歌单只是看看，不代表他要往那儿收藏；
+            // 之前这一行会让爱心加到你正在浏览的歌单，
+            // 然后你去「默认收藏」里找当然找不到。
+            // 收藏目标固定由 is_def==1 决定，见 favoritesListId()。
+            // 从歌单列表里找名字，交给 UI 显示在页头。
+            std::string name = openId;
+            for (const auto &pl : mKugou->playlists()) {
+              if (pl.id == openId) {
+                name = pl.name;
+                break;
+              }
+            }
+            mUi.enterFavoritePlaylist(openId, name);
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                                "歌单已打开 %s 共 %zu 首", name.c_str(),
+                                songs.size());
+          } else {
+            mUi.notify("打开歌单失败: " + mKugou->lastError(), 4000);
+            __android_log_print(ANDROID_LOG_WARN, kTag, "打开歌单失败: %s",
+                                mKugou->lastError().c_str());
+          }
+        }
       }
 
       // 处理界面提交的搜索请求。
       bool doSearch = false;
       std::string keyword;
       int target = 0;
+      // 搜索分类：0=单曲 1=专辑 2=歌手。
+      const int searchKind = mUi.searchKind();
       if (mFavoritesPending.exchange(false) && mKugou != nullptr) {
         if (mKugou->loadFavorites()) {
           // 只有拉取成功才覆盖缓存。失败时 tracks() 里仍是上一次搜索
@@ -1053,6 +1237,37 @@ private:
       }
       if (doSearch && mKugou != nullptr) {
         const bool daily = (target >= 2);
+        // 搜索页的非单曲分类：走 searchByKind，结果不进歌曲列表。
+        if (!daily && target == 0 && searchKind != 0) {
+          const musicmod::SearchKind kind =
+              (searchKind == 1) ? musicmod::SearchKind::Album
+                                : musicmod::SearchKind::Artist;
+          const bool kOk = mKugou->searchByKind(kind, keyword);
+          if (kOk) {
+            if (kind == musicmod::SearchKind::Album) {
+              mUi.setSearchAlbums(mKugou->albums());
+              __android_log_print(ANDROID_LOG_INFO, kTag,
+                                  "搜索分类=专辑 命中 %zu",
+                                  mKugou->albums().size());
+            } else {
+              mUi.setSearchArtists(mKugou->artists());
+              __android_log_print(ANDROID_LOG_INFO, kTag,
+                                  "搜索分类=歌手 命中 %zu",
+                                  mKugou->artists().size());
+            }
+          } else {
+            // 失败时清空对应缓存，避免旧结果留在屏幕上误导玩家。
+            if (kind == musicmod::SearchKind::Album) {
+              mUi.setSearchAlbums({});
+            } else {
+              mUi.setSearchArtists({});
+            }
+            mUi.notify("搜索失败: " + mKugou->lastError(), 3000);
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                                "分类搜索失败 kind=%d err=%s", searchKind,
+                                mKugou->lastError().c_str());
+          }
+        } else {
         const bool ok =
             daily ? mKugou->loadDailyRecommend(target - 2)
                   : mKugou->search(keyword);
@@ -1082,6 +1297,7 @@ private:
         } else {
           __android_log_print(ANDROID_LOG_WARN, kTag, "加载失败: %s",
                               daily ? "每日推荐" : keyword.c_str());
+        }
         }
         mUi.refresh(true);
       }
@@ -1135,6 +1351,7 @@ private:
           mKugou->logout();
         }
         mUi.setAccountState(false, std::string());
+        mUi.clearAvatar();
         mUi.closeLogin();
         mUi.notify("已退出登录", 3000);
       }
@@ -1403,10 +1620,377 @@ private:
     }
   }
 
+  // 主线程侧：只做两件事——按需唤起后台线程、取出后台准备好的结果。
+  // 这里绝不能有网络调用，一次 12 秒阻塞就能让歌词、世界检测全部失真。
+  void refreshAvatar() {
+    if (mKugou == nullptr || !mKugou->loggedIn()) {
+      return;
+    }
+    // 还没有结果时唤起后台；已有结果就直接消费。
+    if (!mAvatarBusy.load()) {
+      bool hasResult = false;
+      {
+        std::lock_guard<std::mutex> lock(mAvatarMutex);
+        hasResult = mAvatarHasNick || mAvatarHasFile;
+      }
+      if (hasResult) {
+        std::string nickname;
+        std::string path;
+        {
+          std::lock_guard<std::mutex> lock(mAvatarMutex);
+          if (mAvatarHasNick) {
+            nickname = mAvatarReadyNick;
+            mAvatarHasNick = false;
+          }
+          if (mAvatarHasFile) {
+            path = mAvatarReadyPath;
+            mAvatarHasFile = false;
+          }
+        }
+        if (!nickname.empty()) {
+          mUi.setAccountState(true, nickname);
+        }
+        if (!path.empty()) {
+          // 解码在本机做，不涉及网络，耗时约几毫秒。
+          std::vector<unsigned char> rgba;
+          int width = 0;
+          int height = 0;
+          if (decodeCover(mJavaVm, path, rgba, width, height)) {
+            // 比例 0.5 = 正圆。输出 192 再缩到 48 显示，边缘足够干净。
+            auto frames =
+                makeRoundedCoverFrames(rgba, width, height, 192, 1, 0.5f);
+            if (!frames.empty()) {
+              mUi.uploadAvatar(frames.front(), 192, 192);
+            }
+          } else {
+            __android_log_print(ANDROID_LOG_WARN, kTag, "头像解码失败: %s",
+                                path.c_str());
+          }
+        }
+        return;
+      }
+      // 没结果就排一次后台任务，不等待。
+      mAvatarWanted.store(true);
+    }
+  }
+
+  // 后台线程：缓慢重试，绝不占用主循环。
+  void avatarLoop() {
+    long long nextTryMs = 0;
+    while (!mAvatarStop.load()) {
+      // 每 200ms 醒一次，够快也够省。
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      if (mAvatarStop.load()) {
+        break;
+      }
+      if (!mAvatarWanted.exchange(false)) {
+        continue;
+      }
+      const long long now =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      if (nextTryMs != 0 && now < nextTryMs) {
+        // 还没到时间，放回去下次再试。
+        mAvatarWanted.store(true);
+        continue;
+      }
+      if (mKugou == nullptr || !mKugou->loggedIn()) {
+        nextTryMs = now + 5000;
+        mAvatarWanted.store(true);
+        continue;
+      }
+      mAvatarBusy.store(true);
+      std::string nickname;
+      std::string avatarUrl;
+      const bool got = mKugou->fetchUserInfo(nickname, avatarUrl);
+      std::string path;
+      if (got && !avatarUrl.empty() && avatarUrl != mAvatarAppliedUrl) {
+        const std::string candidate = mDataDir + "/avatar.jpg";
+        if (mKugou->fetchAvatar(avatarUrl, candidate)) {
+          mAvatarAppliedUrl = avatarUrl;
+          path = candidate;
+        }
+      }
+      mAvatarBusy.store(false);
+      if (!got) {
+        // 失败退避 30 秒，避免频繁打接口。
+        nextTryMs = now + 30000;
+        mAvatarWanted.store(true);
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+                            "账号资料未取到, 30s 后重试");
+        continue;
+      }
+      // 成功：10 分钟后再查一次，昵称改动能跟上。
+      nextTryMs = now + 600000;
+      {
+        std::lock_guard<std::mutex> lock(mAvatarMutex);
+        if (!nickname.empty()) {
+          mAvatarReadyNick = nickname;
+          mAvatarHasNick = true;
+        }
+        if (!path.empty()) {
+          mAvatarReadyPath = path;
+          mAvatarHasFile = true;
+        }
+      }
+    }
+  }
+
+  // 歌词线程：慢一次只影响它自己，主循环始终稳定。
+  // 失败按 3s / 8s / 20s 退避，最多 3 次；拿到非空歌词就不再试。
+  // 换歌时目标 id 变了，计数清零重新开始。
+  void lyricLoop() {
+    long long nextTryMs = 0;
+    int attempts = 0;
+    std::string curId;
+    while (!mLyricStop.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      if (mLyricStop.load()) {
+        break;
+      }
+      musicmod::Track target;
+      bool hasTarget = false;
+      {
+        std::lock_guard<std::mutex> lock(mLyricMutex);
+        if (!mLyricReqId.empty()) {
+          target = mLyricReqTrack;
+          hasTarget = true;
+        }
+      }
+      if (!hasTarget) {
+        attempts = 0;
+        curId.clear();
+        nextTryMs = 0;
+        continue;
+      }
+      if (target.id != curId) {
+        curId = target.id;
+        attempts = 0;
+        nextTryMs = 0;
+      }
+      if (attempts >= 3) {
+        continue;
+      }
+      const long long now =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      if (nextTryMs != 0 && now < nextTryMs) {
+        continue;
+      }
+      if (mKugou == nullptr) {
+        continue;
+      }
+      const int attemptNo = ++attempts;
+      std::string text;
+      {
+        // 与封面线程共用一把网络锁：KugouProvider 的成员不是线程安全的。
+        std::lock_guard<std::mutex> netLock(mNetMutex);
+        text = mKugou->lyric(target);
+      }
+      if (!text.empty()) {
+        {
+          std::lock_guard<std::mutex> lock(mLyricMutex);
+          // 目标已经被换掉就直接扔，不交付。
+          if (mLyricReqId == target.id) {
+            mLyricReadyId = target.id;
+            mLyricReadyText = text;
+            mLyricHasResult = true;
+          }
+        }
+        attempts = 3;
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+                            "歌词已获取 第%d次 %.16s", attemptNo,
+                            target.id.c_str());
+      } else {
+        const long long backoffMs =
+            (attemptNo == 1) ? 3000 : (attemptNo == 2 ? 8000 : 20000);
+        nextTryMs = now + backoffMs;
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+                            "歌词为空 第%d次 %.16s 下次重试 %lldms后", attemptNo,
+                            target.id.c_str(), backoffMs);
+      }
+    }
+  }
+
+  // 缓存文件能不能直接复用。只看大小不够：HTML 错误页也可能上千字节。
+  // 必须验文件头，否则坏缓存会被永久复用，封面再也不换。
+  static bool coverFileUsable(const std::string &path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+      return false;
+    }
+    unsigned char head[12] = {0};
+    in.read(reinterpret_cast<char *>(head), static_cast<std::streamsize>(sizeof(head)));
+    if (in.gcount() < static_cast<std::streamsize>(sizeof(head))) {
+      return false;
+    }
+    if (head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF) {
+      return true;
+    }
+    if (head[0] == 0x89 && head[1] == 'P' && head[2] == 'N' && head[3] == 'G') {
+      return true;
+    }
+    if (head[0] == 'G' && head[1] == 'I' && head[2] == 'F') {
+      return true;
+    }
+    if (head[0] == 'R' && head[1] == 'I' && head[2] == 'F' && head[3] == 'F' &&
+        head[8] == 'W' && head[9] == 'E' && head[10] == 'B' && head[11] == 'P') {
+      return true;
+    }
+    return false;
+  }
+
+  // 封面线程：只负责下载文件，不碰 UI。
+  // 失败按 2s / 5s / 12s 退避，最多 3 次；成功即止。
+  // 换歌时目标变了，计数清零重新开始。
+  void coverLoop() {
+    std::string curId;
+    int attempts = 0;
+    long long nextTryMs = 0;
+    while (!mCoverStop.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      if (mCoverStop.load()) {
+        break;
+      }
+      musicmod::Track target;
+      std::string path;
+      bool hasTarget = false;
+      {
+        std::lock_guard<std::mutex> lock(mCoverMutex);
+        if (!mCoverReqId.empty()) {
+          target = mCoverReqTrack;
+          path = mCoverReqPath;
+          hasTarget = true;
+        }
+      }
+      if (!hasTarget) {
+        curId.clear();
+        attempts = 0;
+        nextTryMs = 0;
+        continue;
+      }
+      if (target.id != curId) {
+        curId = target.id;
+        attempts = 0;
+        nextTryMs = 0;
+      }
+      if (attempts >= 3) {
+        continue;
+      }
+      // 本地已经有【有效图片】才复用。只判断大小会把 HTML 错误页当成封面。
+      {
+        if (coverFileUsable(path)) {
+          {
+            std::lock_guard<std::mutex> lock(mCoverMutex);
+            if (mCoverReqId == target.id) {
+              mCoverDoneId = target.id;
+              mCoverDonePath = path;
+            }
+          }
+          attempts = 3;
+          mUi.coverLog("线程: 复用本地缓存 %.16s", target.id.c_str());
+          __android_log_print(ANDROID_LOG_INFO, kTag, "封面复用本地缓存 %.16s",
+                              target.id.c_str());
+          continue;
+        }
+      }
+      const long long now =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      if (nextTryMs != 0 && now < nextTryMs) {
+        continue;
+      }
+      if (mKugou == nullptr) {
+        continue;
+      }
+      const int attemptNo = ++attempts;
+      bool ok = false;
+      {
+        std::lock_guard<std::mutex> netLock(mNetMutex);
+        ok = mKugou->fetchCover(target, path);
+      }
+      if (ok) {
+        {
+          std::lock_guard<std::mutex> lock(mCoverMutex);
+          // 目标已被换掉就丢弃，不交付。
+          if (mCoverReqId == target.id) {
+            mCoverDoneId = target.id;
+            mCoverDonePath = path;
+          }
+        }
+        attempts = 3;
+        mUi.coverLog("线程: 下载成功 第%d次 %.16s", attemptNo,
+                     target.id.c_str());
+        __android_log_print(ANDROID_LOG_INFO, kTag, "封面已下载 第%d次 %.16s",
+                            attemptNo, target.id.c_str());
+      } else {
+        const long long backoffMs =
+            (attemptNo == 1) ? 2000 : (attemptNo == 2 ? 5000 : 12000);
+        nextTryMs = now + backoffMs;
+        mUi.coverLog("线程: 下载失败 第%d次 %.16s 退避%lldms", attemptNo,
+                     target.id.c_str(), backoffMs);
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+                            "封面下载失败 第%d次 %.16s 下次重试 %lldms后",
+                            attemptNo, target.id.c_str(), backoffMs);
+      }
+    }
+  }
+
   void refreshCover() {
     if (!mEngine) {
       return;
     }
+    // 第一步：把封面线程下载好的图贴上去。
+    // decode 和上传都要碰 JNI / 游戏线程，只能在这里做。
+    std::string doneId;
+    std::string donePath;
+    {
+      std::lock_guard<std::mutex> lock(mCoverMutex);
+      if (!mCoverDoneId.empty()) {
+        doneId = mCoverDoneId;
+        donePath = mCoverDonePath;
+        mCoverDoneId.clear();
+        mCoverDonePath.clear();
+      }
+    }
+    if (!doneId.empty()) {
+      const musicmod::Track *nowTrack = mEngine->currentTrack();
+      mUi.coverLog("落地: doneId=%.16s 当前=%.16s %s", doneId.c_str(),
+                   nowTrack != nullptr ? nowTrack->id.c_str() : "(空)",
+                   (nowTrack != nullptr && nowTrack->id == doneId) ? "匹配"
+                                                                   : "不匹配");
+      if (nowTrack != nullptr && nowTrack->id == doneId) {
+        std::vector<unsigned char> rgba;
+        int width = 0;
+        int height = 0;
+        if (decodeCover(mJavaVm, donePath, rgba, width, height)) {
+          auto frames = makeRoundedCoverFrames(rgba, width, height, 256, 1);
+          __android_log_print(ANDROID_LOG_INFO, kTag, "封面上传 帧=%zu 源=%dx%d",
+                              frames.size(), width, height);
+          if (!mUi.uploadCoverFrames(frames, 256, 256)) {
+            mUi.coverLog("落地: 上传返回失败 %.16s", doneId.c_str());
+          }
+        } else {
+          mUi.coverLog("落地: 解码失败, 删缓存 %.16s", doneId.c_str());
+          __android_log_print(ANDROID_LOG_WARN, kTag,
+                              "封面解码失败, 保留旧图: %s", donePath.c_str());
+          // 文件坏了立刻删掉。留着的话下次切回来又会被当成可用缓存，
+          // 于是这首歌的封面永远不换 —— 就是这个 bug 最隐蔽的一环。
+          std::remove(donePath.c_str());
+        }
+      } else {
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+                            "封面丢弃(期间切歌): %.16s -> %.16s", doneId.c_str(),
+                            nowTrack != nullptr
+                                ? nowTrack->id.substr(0, 16).c_str()
+                                : "(空)");
+      }
+    }
+
+    // 第二步：检测换歌，给封面线程下发下载任务。
     const musicmod::Track *track = mEngine->currentTrack();
     if (track == nullptr) {
       if (!mLastCoverKey.empty()) {
@@ -1418,41 +2002,33 @@ private:
     if (track->id == mLastCoverKey) {
       return;
     }
-mLastCoverKey = track->id;
+    mLastCoverKey = track->id;
+    mUi.coverLog("换歌: %.16s 本地图=%d", track->id.c_str(),
+                 track->coverPath.empty() ? 0 : 1);
     __android_log_print(ANDROID_LOG_INFO, kTag, "封面切换 id=%.40s 有本地图=%d",
                         track->id.c_str(), track->coverPath.empty() ? 0 : 1);
-    if (track->coverPath.empty()) {
-      const std::string path =
-          mDataDir + "/cover_" + (track->id.empty() ? "unknown" : track->id) +
-          ".jpg";
-      if (mKugou != nullptr && mKugou->fetchCover(*track, path)) {
-        std::vector<unsigned char> rgba;
-        int width = 0;
-        int height = 0;
-        if (decodeCover(mJavaVm, path, rgba, width, height)) {
-          auto frames = makeRoundedCoverFrames(rgba, width, height, 256, 1);
-          __android_log_print(ANDROID_LOG_INFO, kTag, "封面上传 帧=%zu 源=%dx%d",
-                              frames.size(), width, height);
-          mUi.uploadCoverFrames(frames, 256, 256);
-          return;
-        }
+    if (!track->coverPath.empty()) {
+      // 曲目自带本地图：直接解码上传，不联网。
+      std::vector<unsigned char> rgba;
+      int width = 0;
+      int height = 0;
+      if (decodeCover(mJavaVm, track->coverPath, rgba, width, height)) {
+        auto frames = makeRoundedCoverFrames(rgba, width, height, 256, 1);
+        mUi.uploadCoverFrames(frames, 256, 256);
+      } else {
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+                            "封面解码失败, 保留旧图: %s",
+                            track->coverPath.c_str());
       }
-      // 拉取或解码失败时保留上一张封面，不再清空。
-      // 清空会让画面出现「有→无→有」的闪烁，比显示旧图更差。
-      __android_log_print(ANDROID_LOG_WARN, kTag,
-                          "封面拉取或解码失败, 保留旧图 id=%.40s",
-                          track->id.c_str());
       return;
     }
-    std::vector<unsigned char> rgba;
-    int width = 0;
-    int height = 0;
-    if (decodeCover(mJavaVm, track->coverPath, rgba, width, height)) {
-      auto frames = makeRoundedCoverFrames(rgba, width, height, 256, 1);
-      mUi.uploadCoverFrames(frames, 256, 256);
-    } else {
-      __android_log_print(ANDROID_LOG_WARN, kTag, "封面解码失败, 保留旧图: %s",
-                          track->coverPath.c_str());
+    // 交给封面线程下载。主循环绝不能再碰这个网络请求。
+    {
+      std::lock_guard<std::mutex> lock(mCoverMutex);
+      mCoverReqPath = mDataDir + "/cover_" +
+                      (track->id.empty() ? "unknown" : track->id) + ".jpg";
+      mCoverReqTrack = *track;
+      mCoverReqId = track->id;
     }
   }
 
@@ -1476,6 +2052,33 @@ mLastCoverKey = track->id;
   // 保存后同步镜像，防止更新覆盖丢数据。
   std::function<void()> mMirrorOut;
   std::string mLastCoverKey;
+  // 封面线程状态。下载在后台做，主循环只负责解码和上传。
+  std::thread mCoverWorker;
+  std::atomic<bool> mCoverStop{false};
+  std::mutex mCoverMutex;
+  musicmod::Track mCoverReqTrack;  // 要下封面的曲目副本
+  std::string mCoverReqPath;       // 下载到哪个本地文件
+  std::string mCoverReqId;         // 对应曲目 id
+  std::string mCoverDoneId;        // 下载完成的曲目 id
+  std::string mCoverDonePath;      // 完成后的本地文件
+  // 歌词线程和封面线程都要打服务库，串行化避免并发写 KugouProvider。
+  std::mutex mNetMutex;
+  // 头像拉取全部在后台线程做。
+  // 原因：httpGet 是阻塞 socket，超时 12 秒。v39 把它放在主循环里同步调用，
+  // 一次失败就让主循环停摆十几秒——歌词行号不推进、世界检测失准、
+  // 退出世界不暂停，全都由此而来。主线程碰网络是根因，必须搬走。
+  std::thread mAvatarWorker;
+  std::atomic<bool> mAvatarStop{false};
+  std::atomic<bool> mAvatarBusy{false};
+  std::atomic<bool> mAvatarWanted{false};
+  // 后台线程写、主线程读，用互斥锁保护。
+  std::mutex mAvatarMutex;
+  std::string mAvatarReadyNick;
+  std::string mAvatarReadyPath;
+  bool mAvatarHasNick{false};
+  bool mAvatarHasFile{false};
+  // 上次已经处理过的地址，避免同一张图反复解码上传。
+  std::string mAvatarAppliedUrl;
   std::string mLastLyricId;
   // 歌词重试状态。
   // 原来只有「id 变了才拉一次，拉失败也记成已拉过」，
@@ -1483,9 +2086,16 @@ mLastCoverKey = track->id;
   // 而实际上它有歌词 —— 这就是「绝对是歌词问题」的那个现象。
   // 现在：失败后按 3s / 8s / 20s 退避重试，最多 3 次；
   // 成功（拿到非空歌词）后不再重试。
-  int mLyricTryCount{0};
-  long long mNextLyricTryMs{0};
-  bool mLyricGot{false};
+  // 歌词线程状态。歌词的网络请求一律在这个线程里做，主循环只交换数据。
+  // 复用头像线程的模式：stop 标志 + 互斥保护的交接区。
+  std::thread mLyricWorker;
+  std::atomic<bool> mLyricStop{false};
+  std::mutex mLyricMutex;
+  musicmod::Track mLyricReqTrack;   // 当前要拉的曲目副本
+  std::string mLyricReqId;          // 对应曲目 id，换歌就改它
+  std::string mLyricReadyId;        // 线程拉回来的曲目 id
+  std::string mLyricReadyText;      // 线程拉回来的歌词正文
+  bool mLyricHasResult{false};
   // 扫码登录状态：当前二维码 key 与下次轮询时间。
   std::string mQrKey;
   long long mQrNextMs{0};
@@ -1514,6 +2124,8 @@ mLastCoverKey = track->id;
   std::vector<musicmod::Track> mSearchList;
   std::vector<musicmod::Track> mRecommendList;
   std::vector<musicmod::Track> mFavoriteList;
+  // 收藏内容变过，下次进收藏页要硬刷。
+  bool mFavListDirty{false};
   // 推荐三个子页各自缓存，避免切页时互相覆盖。
   // 索引：0 红心，1 探索，2 小众。
   std::vector<musicmod::Track> mRecCache[3];

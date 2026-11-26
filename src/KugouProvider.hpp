@@ -25,8 +25,27 @@ public:
   std::string streamUrl(const Track &track) override;
   std::string lyric(const Track &track) override;
 
-  // 按关键词搜索，成功后替换内部曲目列表。
+  // 按关键词搜索歌曲，成功后替换内部曲目列表。
   bool search(const std::string &keywords);
+  // ---- 多分类搜索 ----
+  // 按类型搜索。Song 走 /search，Album 走 /search/album，
+  // Artist 走 /search/artist（歌手）。结果分别放 mAlbums / mArtists。
+  bool searchByKind(SearchKind kind, const std::string &keywords);
+  const std::vector<AlbumInfo> &albums() const { return mAlbums; }
+  const std::vector<ArtistInfo> &artists() const { return mArtists; }
+  // ---- 歌手主页 ----
+  // 拉歌手资料（名字、头像、作品数）。
+  bool loadArtistDetail(const std::string &artistId);
+  // 拉歌手单曲。sort: "hot" 按热度，其余按时间。
+  bool loadArtistSongs(const std::string &artistId,
+                       const std::string &sort = "hot");
+  // 拉歌手专辑。
+  bool loadArtistAlbums(const std::string &artistId,
+                        const std::string &sort = "hot");
+  // 最近一次拉到的歌手资料。
+  const ArtistInfo &currentArtist() const { return mCurrentArtist; }
+  // 拉某个专辑的歌曲。
+  bool loadAlbumSongs(const std::string &albumId);
   // 加载「我喜欢」歌单，替换内部曲目列表。
   bool loadFavorites();
   // 每日自动推荐：variant=0 探索，variant=1 小众。
@@ -35,6 +54,33 @@ public:
   bool loadSimilar(const Track &seed);
   // 下载曲目封面到 path，成功返回 true。
   bool fetchCover(const Track &track, const std::string &path);
+  // ---- 收藏（收进酷狗「我喜欢」）----
+  // 把一首歌加进「我喜欢」。成功返回 true，失败原因写 lastError。
+  bool addToFavorites(const Track &track);
+  // 从「我喜欢」移除。
+  bool removeFromFavorites(const Track &track);
+  // 查询「我喜欢」里是否已有这首歌。未知时返回 false。
+  bool isFavorite(const Track &track);
+  // 按 hash 在收藏歌单里查数字 fileid。删除收藏必须用它。
+  bool findFavoriteFileId(const std::string &hash, std::string &fileId);
+  // 取「我喜欢」的 listid，内部有缓存。
+  std::string favoritesListId();
+  // ---- 歌单列表（收藏页第一层）----
+  // 拉账号下所有歌单。成功返回 true，结果放 mPlaylists。
+  bool loadPlaylists();
+  // 当前缓存里的歌单列表。
+  const std::vector<PlaylistInfo> &playlists() const { return mPlaylists; }
+  // 按 listid 拉某个歌单的全部歌曲，成功返回 true，结果放 tracks()。
+  bool loadPlaylistTracks(const std::string &listId);
+  // 记住玩家选中的歌单，之后 addToFavorites 就往这个歌单里加。
+  void setActivePlaylist(const std::string &listId) { mFavListId = listId; }
+  const std::string &activePlaylistId() const { return mFavListId; }
+
+  // 拉账号资料：昵称与头像图片地址。成功返回 true。
+  // 头像字段名没有公开文档，按常见候选逐个试探并打日志。
+  bool fetchUserInfo(std::string &nickname, std::string &avatarUrl);
+  // 按完整 URL 下载头像到 path，成功返回 true。
+  bool fetchAvatar(const std::string &url, const std::string &path);
 
   // ---- 登录（扫码 / 手机号）----
   // 直接向酷狗官方接口申请扫码 key 与官方二维码图。
@@ -79,6 +125,17 @@ private:
   std::string mVipToken;
   std::string mVipType;
   std::string mLastError;
+  // 当前选中的收藏歌单 listid。空表示还没选，用默认（我喜欢）。
+  std::string mFavListId;
+  // 收藏目标歌单名（日志用）。
+  std::string mFavListName;
+  // 歌单列表缓存。
+  std::vector<PlaylistInfo> mPlaylists;
+  // 多分类搜索缓存。
+  std::vector<AlbumInfo> mAlbums;
+  std::vector<ArtistInfo> mArtists;
+  // 当前打开的歌手资料。
+  ArtistInfo mCurrentArtist;
 };
 
 } // namespace musicmod

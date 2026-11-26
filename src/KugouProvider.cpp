@@ -770,6 +770,197 @@ bool KugouProvider::search(const std::string &keywords) {
   return true;
 }
 
+bool KugouProvider::loadPlaylists() {
+  mPlaylists.clear();
+  if (mPort <= 0 || mToken.empty()) {
+    mLastError = "请先登录";
+    return false;
+  }
+  const std::string cookieText =
+      "token=" + mToken + "; userid=" + mUserId;
+  const std::string cookieArg = "&cookie=" + urlEncode(cookieText);
+  const HttpResult result =
+      httpGet(mPort, "/user/playlist?page=1&pagesize=100" + cookieArg, 12000);
+  if (!result.ok || result.body.empty()) {
+    mLastError = "歌单列表请求失败";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "歌单列表请求失败: status=%d",
+                        result.status);
+    return false;
+  }
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    const auto &data = root["data"];
+    if (!data.is_object() || !data.contains("info") ||
+        !data["info"].is_array()) {
+      mLastError = "歌单结构不识别";
+      __android_log_print(ANDROID_LOG_WARN, kTag,
+                          "歌单结构不识别: %.240s", result.body.c_str());
+      return false;
+    }
+    for (const auto &item : data["info"]) {
+      PlaylistInfo info;
+      info.id = jsonString(item, "list_create_listid");
+      if (info.id.empty()) {
+        continue;
+      }
+      info.gid = jsonString(item, "list_create_gid");
+      info.name = jsonString(item, "name");
+      if (info.name.empty()) {
+        info.name = "未命名歌单";
+      }
+      // 封面字段名不统一，按常见候选依次试。
+      for (const char *field : {"pic", "cover", "img", "list_pic"}) {
+        const std::string pic = jsonString(item, field);
+        if (!pic.empty() && pic.rfind("http", 0) == 0) {
+          info.cover = pic;
+          break;
+        }
+      }
+      if (item.contains("m_count") && item["m_count"].is_number()) {
+        info.count = item["m_count"].get<int>();
+      }
+      if (item.contains("type") && item["type"].is_number()) {
+        info.type = item["type"].get<int>();
+      }
+      // 「默认收藏」判据：实测字段是 is_def，值为 1。
+      // 用户账号实测：listid=1 name=默认收藏 is_def=1（这才是默认那张）,
+      //               listid=2 name=我喜欢   is_def=2。
+      // 旧实现用 is_pri（恒 0）和 name=="我喜欢"，把「我喜欢」错标成默认。
+      if (item.contains("is_def") && item["is_def"].is_number() &&
+          item["is_def"].get<int>() == 1) {
+        info.isDefault = true;
+      }
+      if (info.name.find("默认") != std::string::npos) {
+        info.isDefault = true;
+      }
+      mPlaylists.push_back(std::move(info));
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag, "歌单列表加载完成 %zu 个",
+                        mPlaylists.size());
+    // 默认选中「我喜欢」。没标出来的话退回曲目最多的那个。
+    if (mFavListId.empty() && !mPlaylists.empty()) {
+      std::string best;
+      int bestCount = -1;
+      for (const auto &pl : mPlaylists) {
+        // isDefault 已经在上面按 is_def==1 标好了，这里直接优先取它。
+        if (pl.isDefault && !pl.id.empty()) {
+          best = pl.id;
+          bestCount = pl.count;
+          break;
+        }
+        if (pl.count > bestCount) {
+          bestCount = pl.count;
+          best = pl.id;
+        }
+      }
+      if (!best.empty()) {
+        mFavListId = best;
+        __android_log_print(ANDROID_LOG_INFO, kTag, "默认选中歌单 listid=%s",
+                            best.c_str());
+      }
+    }
+    return !mPlaylists.empty();
+  } catch (const std::exception &error) {
+    mLastError = "歌单列表解析失败";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "歌单列表解析失败: %s",
+                        error.what());
+    return false;
+  }
+}
+
+bool KugouProvider::loadPlaylistTracks(const std::string &listId) {
+  // pagesize 必须小一点：实测 500 会让服务库回 HTTP 502，
+  // 表现为「点歌单打开失败」。100 稳定。
+  if (mPort <= 0 || mToken.empty()) {
+    mLastError = "请先登录";
+    return false;
+  }
+  if (listId.empty()) {
+    mLastError = "歌单 id 为空";
+    return false;
+  }
+  const std::string cookieText =
+      "token=" + mToken + "; userid=" + mUserId;
+  const std::string cookieArg = "&cookie=" + urlEncode(cookieText);
+  const std::string path = "/playlist/track/all/new?listid=" +
+                           urlEncode(listId) + "&page=1&pagesize=100" +
+                           cookieArg;
+  const HttpResult result = httpGet(mPort, path, 12000);
+  if (!result.ok || result.body.empty()) {
+    mLastError = "歌单歌曲请求失败";
+    return false;
+  }
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    const auto &data = root["data"];
+    // 空歌单的返回里没有 info 数组。这是正常状态，不是解析失败：
+    // 清空当前列表并返回 true，让 UI 进到第二层显示「这个歌单还是空的」。
+    if (!data.is_object() || !data.contains("info") ||
+        !data["info"].is_array()) {
+      mTracks.clear();
+      __android_log_print(ANDROID_LOG_INFO, kTag,
+                          "歌单 %s 为空(无 info 数组)", listId.c_str());
+      return true;
+    }
+    std::vector<Track> parsed;
+    parsed.reserve(data["info"].size());
+    for (const auto &item : data["info"]) {
+      Track track;
+      track.id = jsonString(item, "hash");
+      track.fileId = jsonString(item, "fileid");
+      track.albumId = jsonString(item, "album_id");
+      // album_audio_id 必须用 mixsongid，不是 audio_id。
+      // 实测歌单接口两个字段都在，但值完全不同：
+      //   林俊杰《由你选择》audio_id=717628, mixsongid=32068124
+      // 播放接口和歌词接口要的是 mixsongid。传成 audio_id 的后果是
+      //   取播放地址 -> 服务端找不到 -> UI 报「没有版权」
+      //   搜歌词     -> 匹配不上   -> UI 显示「暂无歌词」
+      // 搜索页一直是对的（那边本来就用 MixSongID 优先），所以搜索能播、
+      // 歌单和收藏不能播。这里对齐搜索页的顺序。
+      track.audioId = jsonString(item, "mixsongid");
+      if (track.audioId.empty()) {
+        track.audioId = jsonString(item, "audio_id");
+      }
+      if (item.contains("singerinfo") && item["singerinfo"].is_array() &&
+          !item["singerinfo"].empty()) {
+        std::string joined;
+        for (const auto &singer : item["singerinfo"]) {
+          const std::string one = cleanText(jsonString(singer, "name"));
+          if (one.empty()) {
+            continue;
+          }
+          if (!joined.empty()) {
+            joined += "、";
+          }
+          joined += one;
+        }
+        track.artist = joined;
+      }
+      track.title = stripAudioName(cleanText(jsonString(item, "name")));
+      if (track.title.empty()) {
+        track.title = cleanText(jsonString(item, "name"));
+      }
+      if (item.contains("timelen") && item["timelen"].is_number()) {
+        track.durationMs = item["timelen"].get<long long>();
+      }
+      if (track.id.empty() || track.title.empty()) {
+        continue;
+      }
+      parsed.push_back(std::move(track));
+    }
+    mTracks = std::move(parsed);
+    __android_log_print(ANDROID_LOG_INFO, kTag, "歌单 %s 加载 %zu 首",
+                        listId.c_str(), mTracks.size());
+    // 解析出 0 首也返回 true：空歌单是可进入的正常状态。
+    return true;
+  } catch (const std::exception &error) {
+    mLastError = "歌单歌曲解析失败";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "歌单歌曲解析失败: %s",
+                        error.what());
+    return false;
+  }
+}
+
 bool KugouProvider::loadFavorites() {
   if (mPort <= 0 || mToken.empty()) {
     mLastError = "请先登录";
@@ -843,12 +1034,13 @@ bool KugouProvider::loadFavorites() {
     for (const auto &item : data["info"]) {
       Track track;
       track.id = jsonString(item, "hash");
+      track.fileId = jsonString(item, "fileid");
       track.albumId = jsonString(item, "album_id");
-      // audio_id 在红心接口里可能叫 audio_id，也可能叫 mixsongid，
-      // 取不到就拿 hash 兜底（歌词/封面接口都接受 hash）。
-      track.audioId = jsonString(item, "audio_id");
+      // 同 loadPlaylistTracks：album_audio_id 用 mixsongid，audio_id 兜底。
+      // 这两个字段在红心接口里都有，但值不同，选错就播不了、也没歌词。
+      track.audioId = jsonString(item, "mixsongid");
       if (track.audioId.empty()) {
-        track.audioId = jsonString(item, "mixsongid");
+        track.audioId = jsonString(item, "audio_id");
       }
       // 歌手：把所有 singerinfo 用「、」连起来，和酷狗显示一致。
       if (item.contains("singerinfo") && item["singerinfo"].is_array() &&
@@ -898,6 +1090,30 @@ bool KugouProvider::loadFavorites() {
   }
 }
 
+// 只看文件头判断是不是图片。够用，而且不需要解码库。
+// 必须做这个判断：防盗链/CDN 出错时返回的 HTML 也是非空响应体，
+// 直接落盘会被后续当成封面文件，解码永远失败。
+static bool looksLikeImage(const std::string &data) {
+  if (data.size() < 12) {
+    return false;
+  }
+  const auto *b = reinterpret_cast<const unsigned char *>(data.data());
+  if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) {
+    return true;  // JPEG
+  }
+  if (b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') {
+    return true;  // PNG
+  }
+  if (b[0] == 'G' && b[1] == 'I' && b[2] == 'F') {
+    return true;  // GIF
+  }
+  if (b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' && b[8] == 'W' &&
+      b[9] == 'E' && b[10] == 'B' && b[11] == 'P') {
+    return true;  // WEBP
+  }
+  return false;
+}
+
 bool KugouProvider::fetchCover(const Track &track, const std::string &path) {
   if (mPort <= 0 || track.id.empty()) {
     return false;
@@ -934,16 +1150,43 @@ bool KugouProvider::fetchCover(const Track &track, const std::string &path) {
   if (cover.rfind("http", 0) != 0) {
     return false;
   }
-  const HttpResult image = httpGetUrl(cover, {{"User-Agent", "Mozilla/5.0"}}, 10000);
+  // 带 Referer：酷狗 CDN 对部分封面做了防盗链，不带会被挡回错误页。
+  const HttpResult image = httpGetUrl(
+      cover,
+      {{"User-Agent",
+        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36"},
+       {"Referer", "https://www.kugou.com/"},
+       {"Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}},
+      10000);
   if (!image.ok || image.body.empty()) {
     return false;
   }
-  std::ofstream out(path, std::ios::binary);
-  if (!out) {
+  // 关键校验：内容必须真的是图片。见文件顶部 looksLikeImage 的说明。
+  if (!looksLikeImage(image.body)) {
+    __android_log_print(ANDROID_LOG_WARN, kTag,
+                        "封面不是图片, 拒收: 大小=%zu 前4字节=%02X%02X%02X%02X",
+                        image.body.size(),
+                        static_cast<unsigned char>(image.body[0]),
+                        static_cast<unsigned char>(image.body[1]),
+                        static_cast<unsigned char>(image.body[2]),
+                        static_cast<unsigned char>(image.body[3]));
     return false;
   }
-  out.write(image.body.data(), static_cast<std::streamsize>(image.body.size()));
-  out.close();
+  // 先写临时文件再改名：中途中断不会留下半截文件被当成有效缓存。
+  const std::string tmpPath = path + ".part";
+  {
+    std::ofstream out(tmpPath, std::ios::binary);
+    if (!out) {
+      return false;
+    }
+    out.write(image.body.data(), static_cast<std::streamsize>(image.body.size()));
+    out.close();
+  }
+  std::remove(path.c_str());
+  if (std::rename(tmpPath.c_str(), path.c_str()) != 0) {
+    std::remove(tmpPath.c_str());
+    return false;
+  }
   __android_log_print(ANDROID_LOG_INFO, kTag, "封面已下载 %zu 字节 %s",
                       image.body.size(), cover.c_str());
   return true;
@@ -1514,6 +1757,790 @@ void KugouProvider::reportListen(const Track &track, const std::string &event,
                       "听歌上报 %s 曲目=%s 时长=%lld 结果=%.120s",
                       event.c_str(), track.audioId.c_str(), durationMs,
                       result.body.c_str());
+}
+
+bool KugouProvider::fetchUserInfo(std::string &nickname,
+                                  std::string &avatarUrl) {
+  nickname.clear();
+  avatarUrl.clear();
+  if (mPort <= 0) {
+    return false;
+  }
+  if (mToken.empty()) {
+    return false;
+  }
+  const std::string cookieText =
+      "token=" + mToken + "; userid=" + mUserId;
+  const std::string path = "/user/detail?cookie=" + urlEncode(cookieText);
+  const HttpResult result = httpGet(mPort, path, 12000);
+  __android_log_print(ANDROID_LOG_INFO, kTag, "用户资料响应 长度=%zu %.400s",
+                      result.body.size(), result.body.c_str());
+  if (result.body.empty()) {
+    return false;
+  }
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    // 昵称：概念版的资料结构没有公开文档，按常见字段依次试探。
+    for (const char *field : {"nickname", "user_name", "username", "nick"}) {
+      const std::string text = nodeText(findJsonNode(root, field));
+      if (!text.empty()) {
+        nickname = text;
+        break;
+      }
+    }
+    // 头像：找到第一个像 URL 的字段就用。
+    for (const char *field : {"pic", "user_pic", "img", "pic_url",
+                              "avatar", "head_img"}) {
+      const std::string text = nodeText(findJsonNode(root, field));
+      if (!text.empty() && text.rfind("http", 0) == 0) {
+        avatarUrl = text;
+        break;
+      }
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "用户资料解析: 昵称=%s 头像=%s",
+                        nickname.empty() ? "(空)" : nickname.c_str(),
+                        avatarUrl.empty() ? "(空)" : avatarUrl.c_str());
+  } catch (const std::exception &error) {
+    __android_log_print(ANDROID_LOG_WARN, kTag, "用户资料解析失败: %s",
+                        error.what());
+    return false;
+  }
+  return !nickname.empty() || !avatarUrl.empty();
+}
+
+bool KugouProvider::fetchAvatar(const std::string &url,
+                                const std::string &path) {
+  if (url.empty() || url.rfind("http", 0) != 0) {
+    return false;
+  }
+  const HttpResult image =
+      httpGetUrl(url, {{"User-Agent", "Mozilla/5.0"}}, 10000);
+  if (!image.ok || image.body.empty()) {
+    __android_log_print(ANDROID_LOG_WARN, kTag, "头像下载失败 %s", url.c_str());
+    return false;
+  }
+  std::ofstream out(path, std::ios::binary);
+  if (!out) {
+    return false;
+  }
+  out.write(image.body.data(), static_cast<std::streamsize>(image.body.size()));
+  out.close();
+  __android_log_print(ANDROID_LOG_INFO, kTag, "头像已下载 %zu 字节",
+                      image.body.size());
+  return true;
+}
+
+std::string KugouProvider::favoritesListId() {
+  if (!mFavListId.empty()) {
+    return mFavListId;
+  }
+  if (mPort <= 0 || mToken.empty()) {
+    return {};
+  }
+  const std::string cookieText =
+      "token=" + mToken + "; userid=" + mUserId;
+  const std::string cookieArg = "&cookie=" + urlEncode(cookieText);
+  const HttpResult listRes =
+      httpGet(mPort, "/user/playlist?page=1&pagesize=100" + cookieArg, 12000);
+  if (!listRes.ok || listRes.body.empty()) {
+    __android_log_print(ANDROID_LOG_WARN, kTag, "取歌单列表失败, 无法确定我以为");
+    return {};
+  }
+  std::string listId;
+  std::string listName;
+  int bestCount = -1;
+  try {
+    const auto root = nlohmann::json::parse(listRes.body);
+    const auto &data = root["data"];
+    if (data.is_object() && data.contains("info") && data["info"].is_array()) {
+      for (const auto &item : data["info"]) {
+        const std::string id = jsonString(item, "list_create_listid");
+        if (id.empty()) {
+          continue;
+        }
+        int count = 0;
+        if (item.contains("m_count") && item["m_count"].is_number()) {
+          count = item["m_count"].get<int>();
+        }
+        const std::string nm = jsonString(item, "name");
+        // 「默认收藏」判定：实测字段是 is_def，值为 1。
+        // 旧实现用 is_pri，该字段恒为 0，从来没命中过。
+        // 名字里带「默认」也认，避免字段名以后又变。
+        const bool isDef =
+            (item.contains("is_def") && item["is_def"].is_number() &&
+             item["is_def"].get<int>() == 1) ||
+            (nm.find("默认") != std::string::npos);
+        if (isDef) {
+          listId = id;
+          listName = nm;
+          // 默认收藏优先，直接定下来，不再比曲目数。
+          break;
+        }
+        if (count > bestCount) {
+          bestCount = count;
+          listId = id;
+          listName = nm;
+        }
+      }
+    }
+  } catch (const std::exception &) {
+  }
+  if (listId.empty()) {
+    // 兜底：2 是多数账号的「我喜欢」。取不到就试它，失败会打日志。
+    listId = "2";
+  }
+  mFavListId = listId;
+  mFavListName = listName;
+  __android_log_print(ANDROID_LOG_INFO, kTag,
+                      "收藏目标歌单 listid=%s (%s) 曲目数=%d",
+                      mFavListId.c_str(), mFavListName.c_str(), bestCount);
+  return mFavListId;
+}
+
+bool KugouProvider::addToFavorites(const Track &track) {
+  mLastError.clear();
+  if (mPort <= 0) {
+    mLastError = "服务未就绪";
+    return false;
+  }
+  if (mToken.empty()) {
+    mLastError = "请先登录";
+    return false;
+  }
+  const std::string listId = favoritesListId();
+  if (listId.empty()) {
+    mLastError = "找不到我以为歌单";
+    return false;
+  }
+  const long long clienttime = nowSeconds();
+  // data 格式：name|hash|album_id|mixsongid，多项用逗号分隔。
+  const std::string data =
+      track.title + "|" + track.id + "|" + track.albumId + "|" + track.audioId;
+  // 全部参数走 query。
+  // 对照 MD3 handle_tracks_add：它在服务库内部用 q_str / q.get /
+  // param_or_cookie_str 从 query 取所有字段，不读 body。
+  // 之前用 POST + form body，服务库读不到 listid，松手就拒。
+  const std::string path =
+      "/playlist/tracks/add?last_time=" + std::to_string(clienttime) +
+      "&last_area=gztx" +
+      "&userid=" + urlEncode(mUserId) +
+      "&token=" + urlEncode(mToken) +
+      "&listid=" + urlEncode(listId) +
+      "&list_ver=0&type=0&slow_upload=1" +
+      "&scene=" + urlEncode("false;null") +
+      "&data=" + urlEncode(data) +
+      "&cookie=" + urlEncode("token=" + mToken + "; userid=" + mUserId);
+  __android_log_print(ANDROID_LOG_INFO, kTag,
+                      "收藏请求 listid=%s hash=%.20s album=%s audio=%s",
+                      listId.c_str(), track.id.c_str(), track.albumId.c_str(),
+                      track.audioId.c_str());
+  const HttpResult result = httpGet(mPort, path, 15000);
+  __android_log_print(ANDROID_LOG_INFO, kTag, "收藏响应 status=%d body=%.400s",
+                      result.status, result.body.c_str());
+  if (result.body.empty()) {
+    mLastError = "网络无响应";
+    return false;
+  }
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    // 成功判据必须只看 data.status == 1。
+    // 实测响应：{"data":{"status":1,"listid":1,...}} —— status 在 data 里面。
+    // 旧实现读顶层 status / error_code：
+    //   顶层没有这两个字段 → value() 返回默认 0
+    //   → errorCode == 0 恒成立 → 永远返回 true
+    // 于是「提示已添加、歌单里却没有」，取消时又报「歌单里没有这首歌」。
+    const auto *dataNode = findJsonNode(root, "data");
+    int status = 0;
+    if (dataNode != nullptr && dataNode->is_object()) {
+      if (dataNode->contains("status") && (*dataNode)["status"].is_number()) {
+        status = (*dataNode)["status"].get<int>();
+      }
+    }
+    // 有些接口把 status 放顶层，两种都兜一下（但不许再用 error_code==0 判成功）。
+    if (status == 0 && root.contains("status") && root["status"].is_number()) {
+      status = root["status"].get<int>();
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag, "收藏结果 status=%d", status);
+    if (status == 1) {
+      __android_log_print(ANDROID_LOG_INFO, kTag, "收藏成功 %.40s",
+                          track.title.c_str());
+      return true;
+    }
+    std::string reason;
+    for (const char *field : {"error_msg", "msg", "message", "error"}) {
+      reason = nodeText(pickNode(root, field));
+      if (!reason.empty()) {
+        break;
+      }
+    }
+    if (reason.empty()) {
+      reason = "服务端拒绝 status=" + std::to_string(status);
+    }
+    mLastError = reason;
+    __android_log_print(ANDROID_LOG_WARN, kTag, "收藏失败: %s", reason.c_str());
+  } catch (const std::exception &error) {
+    mLastError = error.what();
+    return false;
+  }
+  return false;
+}
+
+bool KugouProvider::removeFromFavorites(const Track &track) {
+  mLastError.clear();
+  if (mPort <= 0 || mToken.empty()) {
+    mLastError = "请先登录";
+    return false;
+  }
+  const std::string listId = favoritesListId();
+  if (listId.empty()) {
+    mLastError = "找不到我以为歌单";
+    return false;
+  }
+  const long long clienttime = nowSeconds();
+  // 参数名必须是 fileids（不是 data），且值必须是数字 fileid。
+  // 实测：传 hash 时接口回 200 但曲目仍然在列表里，等于没删。
+  std::string fileId = track.fileId;
+  if (fileId.empty()) {
+    // 搜索结果里的曲目没有 fileid，先去歌单里按 hash 找一次。
+    const std::string cookieText =
+        "token=" + mToken + "; userid=" + mUserId;
+    const std::string cookieArg = "&cookie=" + urlEncode(cookieText);
+    const std::string listPath = "/playlist/track/all/new?listid=" +
+                                 urlEncode(listId) +
+                                 "&page=1&pagesize=200" + cookieArg;
+    const HttpResult listRes = httpGet(mPort, listPath, 15000);
+    if (listRes.ok && !listRes.body.empty()) {
+      try {
+        const auto root = nlohmann::json::parse(listRes.body);
+        const auto &data = root["data"];
+        if (data.is_object() && data.contains("info") &&
+            data["info"].is_array()) {
+          for (const auto &item : data["info"]) {
+            if (jsonString(item, "hash") == track.id) {
+              fileId = jsonString(item, "fileid");
+              break;
+            }
+          }
+        }
+      } catch (const std::exception &) {
+      }
+    }
+  }
+  if (fileId.empty()) {
+    mLastError = "歌单里找不到这首歌";
+    __android_log_print(ANDROID_LOG_WARN, kTag,
+                        "取消收藏失败: 拿不到 fileid hash=%.20s",
+                        track.id.c_str());
+    return false;
+  }
+  const std::string path =
+      "/playlist/tracks/del?last_time=" + std::to_string(clienttime) +
+      "&last_area=gztx" +
+      "&userid=" + urlEncode(mUserId) +
+      "&token=" + urlEncode(mToken) +
+      "&listid=" + urlEncode(listId) +
+      "&list_ver=0&type=0" +
+      "&fileids=" + urlEncode(fileId) +
+      "&cookie=" + urlEncode("token=" + mToken + "; userid=" + mUserId);
+  __android_log_print(ANDROID_LOG_INFO, kTag,
+                      "取消收藏 listid=%s fileid=%s hash=%.16s",
+                      listId.c_str(), fileId.c_str(), track.id.c_str());
+  const HttpResult result = httpGet(mPort, path, 15000);
+  __android_log_print(ANDROID_LOG_INFO, kTag,
+                      "取消收藏响应 status=%d body=%.400s", result.status,
+                      result.body.c_str());
+  if (result.body.empty()) {
+    mLastError = "网络无响应";
+    return false;
+  }
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    // 同 addToFavorites：只看 data.status == 1。
+    // 旧写法用 errorCode == 0 兜底，而顶层没有这个字段、value() 返回默认 0，
+    // 于是永远判成功 —— 取消收藏也会「报了成功其实没删」。
+    const auto *dataNode2 = findJsonNode(root, "data");
+    int status2 = 0;
+    if (dataNode2 != nullptr && dataNode2->is_object() &&
+        dataNode2->contains("status") && (*dataNode2)["status"].is_number()) {
+      status2 = (*dataNode2)["status"].get<int>();
+    }
+    if (status2 == 0 && root.contains("status") && root["status"].is_number()) {
+      status2 = root["status"].get<int>();
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag, "取消收藏结果 status=%d",
+                        status2);
+    if (status2 == 1) {
+      return true;
+    }
+    mLastError = "服务端拒绝 status=" + std::to_string(status2);
+  } catch (const std::exception &error) {
+    mLastError = error.what();
+    return false;
+  }
+  return false;
+}
+
+bool KugouProvider::isFavorite(const Track &track) {
+  if (mPort <= 0 || mToken.empty() || track.id.empty()) {
+    return false;
+  }
+  // 直接查「我喜欢」里有没有这个 hash。歌单最多取 500 首，
+  // 超出时可能误判为未收藏，这种情况宁可显示空心也不误报已收藏。
+  const std::string listId = favoritesListId();
+  if (listId.empty()) {
+    return false;
+  }
+  const std::string cookieText =
+      "token=" + mToken + "; userid=" + mUserId;
+  const std::string cookieArg = "&cookie=" + urlEncode(cookieText);
+  const std::string path = "/playlist/track/all/new?listid=" +
+                           urlEncode(listId) + "&page=1&pagesize=100" +
+                           cookieArg;
+  const HttpResult result = httpGet(mPort, path, 12000);
+  if (!result.ok || result.body.empty()) {
+    return false;
+  }
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    const auto &data = root["data"];
+    if (data.is_object() && data.contains("info") && data["info"].is_array()) {
+      for (const auto &item : data["info"]) {
+        if (jsonString(item, "hash") == track.id) {
+          return true;
+        }
+      }
+    }
+  } catch (const std::exception &) {
+  }
+  return false;
+}
+
+bool KugouProvider::findFavoriteFileId(const std::string &hash,
+                                       std::string &fileId) {
+  fileId.clear();
+  if (mPort <= 0 || mToken.empty() || hash.empty()) {
+    return false;
+  }
+  const std::string listId = favoritesListId();
+  if (listId.empty()) {
+    return false;
+  }
+  const std::string cookieText =
+      "token=" + mToken + "; userid=" + mUserId;
+  const std::string cookieArg = "&cookie=" + urlEncode(cookieText);
+  const std::string path = "/playlist/track/all/new?listid=" +
+                           urlEncode(listId) + "&page=1&pagesize=200" +
+                           cookieArg;
+  const HttpResult result = httpGet(mPort, path, 15000);
+  if (!result.ok || result.body.empty()) {
+    return false;
+  }
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    const auto &data = root["data"];
+    if (data.is_object() && data.contains("info") && data["info"].is_array()) {
+      for (const auto &item : data["info"]) {
+        if (jsonString(item, "hash") == hash) {
+          fileId = jsonString(item, "fileid");
+          return !fileId.empty();
+        }
+      }
+    }
+  } catch (const std::exception &) {
+  }
+  return false;
+}
+
+bool KugouProvider::searchByKind(SearchKind kind,
+                                  const std::string &keywords) {
+  if (mPort <= 0 || keywords.empty()) {
+    return false;
+  }
+  if (kind == SearchKind::Song) {
+    return search(keywords);
+  }
+  const char *route =
+      (kind == SearchKind::Album) ? "/search/album" : "/search/artist";
+  const std::string path = std::string(route) + "?keyword=" +
+                           urlEncode(keywords) + "&page=1&pagesize=30";
+  const HttpResult result = httpGet(mPort, path, 12000);
+  if (!result.ok || result.body.empty()) {
+    mLastError = "搜索请求失败";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "搜索失败 %s status=%d",
+                        route, result.status);
+    return false;
+  }
+  // 先打一段原始响应，字段名对不上时靠它定位。只在长度较短时打。
+  __android_log_print(ANDROID_LOG_INFO, kTag, "搜索 %s 响应 %.300s", route,
+                      result.body.c_str());
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    const nlohmann::json *list = pickTrackArray(root);
+    if (list == nullptr) {
+      mLastError = "搜索结果结构不识别";
+      __android_log_print(ANDROID_LOG_WARN, kTag, "搜索 %s 结构不识别",
+                          route);
+      return false;
+    }
+    if (kind == SearchKind::Album) {
+      mAlbums.clear();
+      for (const auto &item : *list) {
+        AlbumInfo album;
+        // 专辑 id：常见 alblum_id / album_id / albumid，全试一遍。
+        for (const char *k : {"album_id", "albumid", "AlbumID", "alblum_id"}) {
+          album.id = jsonString(item, k);
+          if (!album.id.empty()) {
+            break;
+          }
+        }
+        for (const char *k : {"album_name", "albumname", "AlbumName", "name"}) {
+          album.name = cleanText(jsonString(item, k));
+          if (!album.name.empty()) {
+            break;
+          }
+        }
+        for (const char *k : {"singer_name", "singername", "author_name",
+                              "SingerName"}) {
+          album.artist = cleanText(jsonString(item, k));
+          if (!album.artist.empty()) {
+            break;
+          }
+        }
+        for (const char *k : {"imgurl", "img", "cover", "pic", "album_pic"}) {
+          const std::string pic = jsonString(item, k);
+          if (!pic.empty() && pic.rfind("http", 0) == 0) {
+            album.cover = pic;
+            break;
+          }
+        }
+        for (const char *k : {"songcount", "song_count", "songcounts"}) {
+          if (item.contains(k) && item[k].is_number()) {
+            album.songCount = item[k].get<int>();
+            break;
+          }
+        }
+        album.artistId = jsonString(item, "author_id");
+        if (album.artistId.empty()) {
+          album.artistId = jsonString(item, "singerid");
+        }
+        if (album.id.empty() || album.name.empty()) {
+          continue;
+        }
+        mAlbums.push_back(std::move(album));
+      }
+      __android_log_print(ANDROID_LOG_INFO, kTag, "专辑搜索 %s 命中 %zu 张",
+                          keywords.c_str(), mAlbums.size());
+      return !mAlbums.empty();
+    }
+    // 歌手
+    mArtists.clear();
+    for (const auto &item : *list) {
+      ArtistInfo info;
+      for (const char *k : {"author_id", "singerid", "ArtistId", "id"}) {
+        info.id = jsonString(item, k);
+        if (!info.id.empty()) {
+          break;
+        }
+      }
+      for (const char *k : {"author_name", "singername", "SingerName", "name"}) {
+        info.name = cleanText(jsonString(item, k));
+        if (!info.name.empty()) {
+          break;
+        }
+      }
+      for (const char *k : {"avatar", "imgurl", "image", "pic"}) {
+        const std::string pic = jsonString(item, k);
+        if (!pic.empty() && pic.rfind("http", 0) == 0) {
+          info.avatar = pic;
+          break;
+        }
+      }
+      if (item.contains("songcount") && item["songcount"].is_number()) {
+        info.songCount = item["songcount"].get<int>();
+      }
+      if (item.contains("albumcount") && item["albumcount"].is_number()) {
+        info.albumCount = item["albumcount"].get<int>();
+      }
+      if (info.id.empty() || info.name.empty()) {
+        continue;
+      }
+      mArtists.push_back(std::move(info));
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag, "歌手搜索 %s 命中 %zu 位",
+                        keywords.c_str(), mArtists.size());
+    return !mArtists.empty();
+  } catch (const std::exception &error) {
+    mLastError = "搜索结果解析失败";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "搜索解析失败: %s",
+                        error.what());
+    return false;
+  }
+}
+
+bool KugouProvider::loadArtistDetail(const std::string &artistId) {
+  mCurrentArtist = ArtistInfo();
+  mCurrentArtist.id = artistId;
+  if (mPort <= 0 || artistId.empty()) {
+    return false;
+  }
+  const std::string path = "/artist/detail?id=" + urlEncode(artistId);
+  const HttpResult result = httpGet(mPort, path, 12000);
+  if (!result.ok || result.body.empty()) {
+    __android_log_print(ANDROID_LOG_WARN, kTag, "歌手资料请求失败 id=%s",
+                        artistId.c_str());
+    return false;
+  }
+  __android_log_print(ANDROID_LOG_INFO, kTag, "歌手资料响应 %.300s",
+                      result.body.c_str());
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    for (const char *k : {"author_name", "singername", "name"}) {
+      const std::string name = cleanText(nodeText(pickNode(root, k)));
+      if (!name.empty()) {
+        mCurrentArtist.name = name;
+        break;
+      }
+    }
+    for (const char *k : {"avatar", "imgurl", "image", "pic", "sizable_avatar"}) {
+      const std::string pic = nodeText(pickNode(root, k));
+      if (!pic.empty() && pic.rfind("http", 0) == 0) {
+        mCurrentArtist.avatar = pic;
+        break;
+      }
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag, "歌手资料 名字=%s 头像=%s",
+                        mCurrentArtist.name.c_str(),
+                        mCurrentArtist.avatar.empty()
+                            ? "(空)"
+                            : mCurrentArtist.avatar.c_str());
+  } catch (const std::exception &error) {
+    __android_log_print(ANDROID_LOG_WARN, kTag, "歌手资料解析失败: %s",
+                        error.what());
+    return false;
+  }
+  return !mCurrentArtist.name.empty();
+}
+
+bool KugouProvider::loadArtistSongs(const std::string &artistId,
+                                    const std::string &sort) {
+  if (mPort <= 0 || artistId.empty()) {
+    return false;
+  }
+  // sort 参数：MD3 里 hot 传 1，其余传 2。
+  const std::string sortArg = (sort == "hot") ? "1" : "2";
+  // area_code=all 不能省。对照 MD3 的 handle_audios，它的 data_map 里
+  // 除了 author_id/page/pagesize/sort 还带 area_code；漏掉时上游返回
+  // {"total":0,"data":[]}——接口 200 但没有内容。
+  const std::string path = "/artist/audios?id=" + urlEncode(artistId) +
+                           "&page=1&pagesize=100&sort=" + sortArg +
+                           "&area_code=all";
+  const HttpResult result = httpGet(mPort, path, 15000);
+  if (!result.ok || result.body.empty()) {
+    mLastError = "歌手歌曲请求失败";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "歌手歌曲请求失败 id=%s",
+                        artistId.c_str());
+    return false;
+  }
+  __android_log_print(ANDROID_LOG_INFO, kTag, "歌手歌曲响应 %.300s",
+                      result.body.c_str());
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    const nlohmann::json *list = pickTrackArray(root);
+    if (list == nullptr) {
+      mLastError = "歌手歌曲结构不识别";
+      return false;
+    }
+    std::vector<Track> parsed;
+    parsed.reserve(list->size());
+    for (const auto &item : *list) {
+      Track track;
+      // 歌手接口字段名与搜索不同：hash / audio_name / album_id / mixsongid
+      for (const char *k : {"hash", "FileHash", "audio_hash"}) {
+        track.id = jsonString(item, k);
+        if (!track.id.empty()) {
+          break;
+        }
+      }
+      for (const char *k : {"audio_name", "songname", "SongName", "name"}) {
+        const std::string raw = cleanText(jsonString(item, k));
+        if (!raw.empty()) {
+          track.title = stripAudioName(raw);
+          break;
+        }
+      }
+      if (track.title.empty()) {
+        continue;
+      }
+      for (const char *k : {"author_name", "singername", "SingerName"}) {
+        const std::string a = cleanText(jsonString(item, k));
+        if (!a.empty()) {
+          track.artist = a;
+          break;
+        }
+      }
+      track.albumId = jsonString(item, "album_id");
+      if (track.albumId.empty()) {
+        track.albumId = jsonString(item, "AlbumID");
+      }
+      track.audioId = jsonString(item, "mixsongid");
+      if (track.audioId.empty()) {
+        track.audioId = jsonString(item, "audio_id");
+      }
+      if (item.contains("timelen") && item["timelen"].is_number()) {
+        track.durationMs = item["timelen"].get<long long>();
+      }
+      if (track.id.empty()) {
+        continue;
+      }
+      parsed.push_back(std::move(track));
+    }
+    mTracks = std::move(parsed);
+    __android_log_print(ANDROID_LOG_INFO, kTag, "歌手 %s 歌曲 %zu 首",
+                        artistId.c_str(), mTracks.size());
+    return !mTracks.empty();
+  } catch (const std::exception &error) {
+    mLastError = "歌手歌曲解析失败";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "歌手歌曲解析失败: %s",
+                        error.what());
+    return false;
+  }
+}
+
+bool KugouProvider::loadArtistAlbums(const std::string &artistId,
+                                     const std::string &sort) {
+  if (mPort <= 0 || artistId.empty()) {
+    return false;
+  }
+  // MD3 里 albums 的 hot 传 3，其余传 1。
+  const std::string sortArg = (sort == "hot") ? "3" : "1";
+  // 同样对照 MD3 handle_albums：category=1、area_code=all 都必须带。
+  const std::string path = "/artist/albums?id=" + urlEncode(artistId) +
+                           "&page=1&pagesize=50&sort=" + sortArg +
+                           "&category=1&area_code=all";
+  const HttpResult result = httpGet(mPort, path, 15000);
+  if (!result.ok || result.body.empty()) {
+    mLastError = "歌手专辑请求失败";
+    return false;
+  }
+  __android_log_print(ANDROID_LOG_INFO, kTag, "歌手专辑响应 %.300s",
+                      result.body.c_str());
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    const nlohmann::json *list = pickTrackArray(root);
+    if (list == nullptr) {
+      mLastError = "歌手专辑结构不识别";
+      return false;
+    }
+    mAlbums.clear();
+    for (const auto &item : *list) {
+      AlbumInfo album;
+      for (const char *k : {"album_id", "albumid", "AlbumID"}) {
+        album.id = jsonString(item, k);
+        if (!album.id.empty()) {
+          break;
+        }
+      }
+      for (const char *k : {"album_name", "albumname", "AlbumName", "name"}) {
+        album.name = cleanText(jsonString(item, k));
+        if (!album.name.empty()) {
+          break;
+        }
+      }
+      for (const char *k : {"imgurl", "img", "cover", "pic"}) {
+        const std::string pic = jsonString(item, k);
+        if (!pic.empty() && pic.rfind("http", 0) == 0) {
+          album.cover = pic;
+          break;
+        }
+      }
+      album.artistId = artistId;
+      if (album.id.empty() || album.name.empty()) {
+        continue;
+      }
+      mAlbums.push_back(std::move(album));
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag, "歌手 %s 专辑 %zu 张",
+                        artistId.c_str(), mAlbums.size());
+    return !mAlbums.empty();
+  } catch (const std::exception &error) {
+    mLastError = "歌手专辑解析失败";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "歌手专辑解析失败: %s",
+                        error.what());
+    return false;
+  }
+}
+
+bool KugouProvider::loadAlbumSongs(const std::string &albumId) {
+  if (mPort <= 0 || albumId.empty()) {
+    return false;
+  }
+  const std::string path =
+      "/album/songs?album_id=" + urlEncode(albumId) + "&page=1&pagesize=200";
+  const HttpResult result = httpGet(mPort, path, 15000);
+  if (!result.ok || result.body.empty()) {
+    mLastError = "专辑歌曲请求失败";
+    return false;
+  }
+  __android_log_print(ANDROID_LOG_INFO, kTag, "专辑歌曲响应 %.300s",
+                      result.body.c_str());
+  try {
+    const auto root = nlohmann::json::parse(result.body);
+    const nlohmann::json *list = pickTrackArray(root);
+    if (list == nullptr) {
+      mLastError = "专辑歌曲结构不识别";
+      return false;
+    }
+    std::vector<Track> parsed;
+    parsed.reserve(list->size());
+    for (const auto &item : *list) {
+      Track track;
+      for (const char *k : {"hash", "FileHash", "audio_hash"}) {
+        track.id = jsonString(item, k);
+        if (!track.id.empty()) {
+          break;
+        }
+      }
+      for (const char *k : {"audio_name", "songname", "SongName", "name"}) {
+        const std::string raw = cleanText(jsonString(item, k));
+        if (!raw.empty()) {
+          track.title = stripAudioName(raw);
+          break;
+        }
+      }
+      if (track.title.empty()) {
+        continue;
+      }
+      for (const char *k : {"author_name", "singername", "SingerName"}) {
+        const std::string a = cleanText(jsonString(item, k));
+        if (!a.empty()) {
+          track.artist = a;
+          break;
+        }
+      }
+      track.albumId = albumId;
+      track.audioId = jsonString(item, "mixsongid");
+      if (track.audioId.empty()) {
+        track.audioId = jsonString(item, "audio_id");
+      }
+      if (item.contains("timelen") && item["timelen"].is_number()) {
+        track.durationMs = item["timelen"].get<long long>();
+      }
+      if (track.id.empty()) {
+        continue;
+      }
+      parsed.push_back(std::move(track));
+    }
+    mTracks = std::move(parsed);
+    __android_log_print(ANDROID_LOG_INFO, kTag, "专辑 %s 歌曲 %zu 首",
+                        albumId.c_str(), mTracks.size());
+    return !mTracks.empty();
+  } catch (const std::exception &error) {
+    mLastError = "专辑歌曲解析失败";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "专辑歌曲解析失败: %s",
+                        error.what());
+    return false;
+  }
 }
 
 bool KugouProvider::claimVip(std::string &message) {

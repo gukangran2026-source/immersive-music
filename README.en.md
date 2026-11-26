@@ -191,15 +191,22 @@ The full panel has many elements; rebuilding everything each frame drops frames.
 
 ## Disclaimer
 
-This project is for **personal study and technical research only**.
+> Full terms: **[DISCLAIMER.md](DISCLAIMER.md)**. Please read it before building or using this project. Key points below.
 
-- No music content is included, nor any download or sharing functionality.
-- No third-party binaries, credentials, tokens or user data are included.
-- All played content comes from a third-party platform; this project is merely a client.
-- Please support legitimate music services and comply with the laws of your jurisdiction and the platform's terms of service.
-- Any consequences of using this project are borne by the user.
+This is an **unofficial, independent third-party mod**. It is **not affiliated with, endorsed by, sponsored by, or authorised by** Mojang Studios, Microsoft, Minecraft, KuGou Music, LeviLauncher, or their developers. All product names and trademarks belong to their respective owners.
 
-If you arrived here from a search engine: this is not a ready-to-use product for players. It requires a specific launcher on a specific architecture, and you must supply the service library dependency yourself.
+- **No copyrighted content is included.** This repository does not store or distribute music, audio, lyrics, or cover art. All playable media is provided directly by third-party platforms you have logged into; this project is merely a client. The service library required for building must be obtained lawfully by the user — it is neither included nor pointed to here.
+- **No paywall or permission mechanism is bypassed.** No cracking, no circumvention of membership limits, DRM, or regional restrictions. When your account lacks permission, playback failing or returning only a preview clip is **normal platform behaviour, not a bug**.
+- **Credentials stay on your device.** Login tokens are stored only in the app's private directory on your own device. Nothing is uploaded, collected, or shared. There is no backend server; network requests only occur between your device and the third-party platform.
+- **For personal study and technical research only.** Commercial use, paid redistribution, resale, and any infringing or unlawful use are prohibited.
+- **Use entirely at your own risk.** Usage may cause game crashes, corrupted saves, data loss, device issues, or restrictions on your third-party account up to a ban. **You bear all such risk; the author accepts no liability for any direct or indirect damages.** Do not use an account you cannot afford to lose.
+- **Provided "AS IS", without warranty of any kind**, with no promise of usability, stability, security, or maintenance.
+- **Depends on undocumented third-party APIs** that may change, rate-limit, or shut down at any time. This is a structural risk the author cannot control and does not guarantee against.
+- Comply with the laws of your jurisdiction and the platform's terms of service, and please support legitimate music.
+
+**If you disagree with any part of the above, stop using this project and delete it.**
+
+One more note: if you found this via a search engine — **this is not a ready-to-use product for regular players.** It requires a specific launcher (LeviLauncher) on a specific architecture (arm64-v8a), and you must supply the service library dependency yourself.
 
 ## Credits
 

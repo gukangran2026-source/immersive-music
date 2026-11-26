@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdarg>
+#include <sys/stat.h>
 #include <fstream>
 #include <span>
 #include <thread>
@@ -36,6 +38,8 @@ constexpr const char *kTag = "MusicMod";
 constexpr const char *kModuleId = "musicmod.hud";
 constexpr const char *kCoverId = "musicmod.cover";
 constexpr const char *kQrId = "musicmod.qr";
+// 右上角圆形头像的图片 id 前缀，必须与封面分开，否则会互相覆盖。
+constexpr const char *kAvatarId = "musicmod.avatar";
 
 using RegisterModuleFn = bool (*)(const pl::modmenu::ModuleInfo &);
 using SubmitDrawFn = void (*)(std::string_view,
@@ -850,7 +854,9 @@ const char *digitLabel(int index) {
 }
 
 // 取 UTF-8 首字符，用作头像里的一个字。
-std::string firstChar(const std::string &text) {
+// 右上角头像改成真实图片后已无人调用，保留是因为短账号名场景可能再用；
+// 加 maybe_unused 避免 -Wall 下报未使用警告。
+[[maybe_unused]] std::string firstChar(const std::string &text) {
   if (text.empty()) {
     return "我";
   }
@@ -881,6 +887,92 @@ std::size_t hashBytes(const std::vector<unsigned char> &data) {
 
 // 手机号与验证码只用数字。输入法有两种提交方式：逐字追加、整段重发，
 // 这里都兼容，避免出现 1381381 这种叠字。
+
+// 播放模式图标：顺序（三条横线 + 向下箭头）、随机（交叉箭头）、
+// 单曲循环（圆弧 + 数字 1）。
+// 全部用手绘图元堆出来——宿主对 Line 图元不渲染（实测暂停图标可见、
+// 播放图标消失），所以一律用实心矩形、三角和多边形。
+void glyphModeSequential(Out &out, float cx, float cy, float s,
+                         std::uint32_t color) {
+  const float w = s * 0.62f;
+  const float gap = s * 0.24f;
+  // 三条横线，自上而下依次缩短，末端各带一个三角指示向下进行。
+  for (int i = 0; i < 3; ++i) {
+    const float ly = cy - gap + i * gap;
+    const float lw = w * (1.0f - 0.18f * static_cast<float>(i));
+    rect(out, cx - w * 0.5f, ly - s * 0.045f, lw, s * 0.09f, color);
+  }
+  triFill(out, cx + w * 0.5f - s * 0.06f, cy - s * 0.02f,
+          cx + w * 0.5f + s * 0.26f, cy + gap * 0.5f,
+          cx + w * 0.5f - s * 0.06f, cy + gap + s * 0.04f, color);
+}
+
+void glyphModeShuffle(Out &out, float cx, float cy, float s,
+                      std::uint32_t color) {
+  // 两条交叉的斜线，用一串小方块拼出来。
+  // 直接用 diag 会画出很厚的块，缩小后成一坨，所以按固定步长点阵化。
+  const int steps = 9;
+  const float half = s * 0.42f;
+  for (int i = 0; i < steps; ++i) {
+    const float t = static_cast<float>(i) / static_cast<float>(steps - 1);
+    const float px = cx - half + t * half * 2.0f;
+    const float py1 = cy - half + t * half * 2.0f;
+    const float py2 = cy + half - t * half * 2.0f;
+    rect(out, px - s * 0.05f, py1 - s * 0.05f, s * 0.1f, s * 0.1f, color);
+    rect(out, px - s * 0.05f, py2 - s * 0.05f, s * 0.1f, s * 0.1f, color);
+  }
+  // 右端两个箭头尖，表示两条线各自往右上/右下走。
+  triFill(out, cx + half - s * 0.02f, cy - s * 0.02f,
+          cx + half + s * 0.3f, cy - s * 0.3f,
+          cx + half + s * 0.02f, cy - s * 0.34f, color);
+}
+
+void glyphModeRepeatOne(Out &out, float cx, float cy, float s,
+                        std::uint32_t color) {
+  // 圆弧用点阵拼：半径 r，绕 300 度留一个缺口，缺口处画箭头。
+  const float r = s * 0.34f;
+  const int steps = 26;
+  for (int i = 0; i < steps; ++i) {
+    const float a = 0.5f + (6.2831853f * 0.86f) *
+                               (static_cast<float>(i) /
+                                static_cast<float>(steps - 1));
+    const float px = cx + std::cos(a) * r;
+    const float py = cy + std::sin(a) * r;
+    rect(out, px - s * 0.05f, py - s * 0.05f, s * 0.1f, s * 0.1f, color);
+  }
+  // 中间一个「1」：竖条 + 顶部斜钩 + 底部横线。
+  rect(out, cx - s * 0.035f, cy - s * 0.16f, s * 0.07f, s * 0.34f, color);
+  rect(out, cx - s * 0.15f, cy - s * 0.05f, s * 0.11f, s * 0.065f, color);
+}
+
+// 爱心：两个圆 + 一个倒三角，标准画法，缩到 18px 仍然认得出。
+void glyphHeart(Out &out, float cx, float cy, float s, bool filled,
+                std::uint32_t color) {
+  const float r = s * 0.27f;
+  if (filled) {
+    circleFill(out, cx - r * 0.82f, cy - r * 0.30f, r * 2.0f, color);
+    circleFill(out, cx + r * 0.82f, cy - r * 0.30f, r * 2.0f, color);
+    triFill(out, cx - r * 1.70f, cy + r * 0.10f,
+            cx + r * 1.70f, cy + r * 0.10f, cx, cy + r * 2.1f, color);
+  } else {
+    // 空心：用更小的圆挖掉中间，再用底色压一层。
+    // 这里不做真正的挖除（没有混合模式），改用描边式点阵。
+    const int steps = 24;
+    for (int i = 0; i < steps; ++i) {
+      const float t = static_cast<float>(i) / static_cast<float>(steps);
+      const float a = 3.1415926f * t * 2.0f;
+      const float px = cx + std::cos(a) * r * 1.5f;
+      const float py = cy - r * 0.2f + std::sin(a) * r * 1.3f;
+      if (sinf(a) > 0.35f) {
+        continue;   // 下半圆属于尖角区，交给三角
+      }
+      rect(out, px - s * 0.045f, py - s * 0.045f, s * 0.09f, s * 0.09f, color);
+    }
+    triFill(out, cx - r * 1.35f, cy + r * 0.05f,
+            cx + r * 1.35f, cy + r * 0.05f, cx, cy + r * 1.75f, color);
+  }
+}
+
 void appendDigits(std::string &target, const std::string &text,
                   std::size_t limit) {
   std::string digits;
@@ -1547,23 +1639,55 @@ bool HudUi::uploadCoverFrames(
     std::lock_guard<std::mutex> lock(mMutex);
     if (mCoverReady && hash == mCoverHash && width == mCoverW &&
         height == mCoverH) {
+      // 内容和当前显示的一模一样，跳过。打日志是为了区分两种情况：
+      // 一是这张图和上一首真的是同一张（例如服务端给的默认封面），
+      // 二是别的地方出了问题导致拿错图。没有日志就只能猜。
+      __android_log_print(ANDROID_LOG_INFO, kTag,
+                          "封面内容与当前相同, 跳过上传 hash=%zu", hash);
+      coverLog("跳过上传: 内容与当前相同 hash=%zu", hash);
       return true;
     }
   }
   auto registerFn = reinterpret_cast<RegisterImageFn>(mRegisterImage);
   std::vector<std::string> ids;
   ids.reserve(frames.size());
+  bool reusedExisting = false;
   for (std::size_t i = 0; i < frames.size(); ++i) {
     const std::string imageId = std::string(kCoverId) + "." +
                                 std::to_string(hash) + "." +
                                 std::to_string(i);
-    if (!registerFn(imageId.c_str(),
-                    std::span<const unsigned char>(frames[i].data(),
-                                                   frames[i].size()),
-                    width, height)) {
-      return false;
+    const bool registered = registerFn(
+        imageId.c_str(),
+        std::span<const unsigned char>(frames[i].data(), frames[i].size()),
+        width, height);
+    bool known = false;
+    {
+      std::lock_guard<std::mutex> lock(mMutex);
+      known = mRegisteredImages.count(imageId) > 0;
+    }
+    if (!registered) {
+      // 实测：同一个 id 第二次注册必然返回 false（游戏层不接受重复注册）。
+      // 但那张图在第一次成功时就已经在里面了，id 一直有效。
+      // 只有我们自己成功注册过的 id 才允许这样复用；
+      // 从没成功过的 id 失败就是真失败，不能假装成功。
+      if (!known) {
+        __android_log_print(
+            ANDROID_LOG_WARN, kTag,
+            "封面上传失败(registerImage 返回 false) 帧=%zu/%zu id=%s", i,
+            frames.size(), imageId.c_str());
+        coverLog("上传失败: registerImage=false 帧=%zu/%zu id=%s", i,
+                 frames.size(), imageId.c_str());
+        return false;
+      }
+      reusedExisting = true;
+    } else if (!known) {
+      std::lock_guard<std::mutex> lock(mMutex);
+      mRegisteredImages.insert(imageId);
     }
     ids.push_back(imageId);
+  }
+  if (reusedExisting) {
+    coverLog("上传: id 已存在, 直接复用(不重复注册) hash=%zu", hash);
   }
   {
     std::lock_guard<std::mutex> lock(mMutex);
@@ -1577,7 +1701,70 @@ bool HudUi::uploadCoverFrames(
     mCoverHash = hash;
     mDirty = true;
   }
+  // 注意：ids 已经被 move 到 mCoverIds，此时 ids.size() 是 0，
+  // 直接拿它打日志会写出「帧=0」这种误导信息。用 frames.size()。
+  coverLog("上传成功: 帧=%zu 尺寸=%dx%d hash=%zu%s", frames.size(), width,
+           height, hash, reusedExisting ? " (复用已存在id)" : "");
   return true;
+}
+
+bool HudUi::uploadAvatar(const std::vector<unsigned char> &rgba, int width,
+                         int height) {
+  if (mRegisterImage == nullptr || rgba.empty() || width <= 0 || height <= 0 ||
+      rgba.size() < static_cast<std::size_t>(width) * height * 4) {
+    return false;
+  }
+  const std::size_t hash = hashBytes(rgba);
+  {
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (mAvatarReady && hash == mAvatarHash && width == mAvatarW &&
+        height == mAvatarH) {
+      return true;
+    }
+  }
+  auto registerFn = reinterpret_cast<RegisterImageFn>(mRegisterImage);
+  const std::string imageId =
+      std::string(kAvatarId) + "." + std::to_string(hash);
+  const bool avatarRegistered =
+      registerFn(imageId.c_str(),
+                 std::span<const unsigned char>(rgba.data(), rgba.size()),
+                 width, height);
+  if (!avatarRegistered) {
+    // 同封面：重复注册会被拒，但图已在游戏层里，同一个 id 可以直接复用。
+    bool known = false;
+    {
+      std::lock_guard<std::mutex> lock(mMutex);
+      known = mRegisteredImages.count(imageId) > 0;
+    }
+    if (!known) {
+      return false;
+    }
+  } else {
+    std::lock_guard<std::mutex> lock(mMutex);
+    mRegisteredImages.insert(imageId);
+  }
+  {
+    std::lock_guard<std::mutex> lock(mMutex);
+    mAvatarReady = true;
+    mAvatarImg = imageId;
+    mAvatarW = width;
+    mAvatarH = height;
+    mAvatarHash = hash;
+    mDirty = true;
+  }
+  __android_log_print(ANDROID_LOG_INFO, kTag, "头像已上传 %dx%d id=%s",
+                      width, height, imageId.c_str());
+  return true;
+}
+
+const std::string &HudUi::avatarId() const { return mAvatarImg; }
+
+void HudUi::clearAvatar() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mAvatarReady = false;
+  mAvatarImg = std::string(kAvatarId);
+  mAvatarHash = 0;
+  mDirty = true;
 }
 
 const std::string &HudUi::coverId() const {
@@ -1680,6 +1867,21 @@ void HudUi::setLyric(const std::string &trackId, const std::string &text) {
       }
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    // 歌词是异步拉回来的，回来时可能已经切歌。
+    // 不校验就会「歌和歌词对不上」：晚到的那份把新歌的歌词盖掉。
+    //
+    // 必须问引擎要当前曲目，不能用 mDisplayedId：
+    // mDisplayedId 是在 refresh() 的 syncEngine 分支里更新的（约 160ms 一次），
+    // 而 setLyric 是 main 线程拿到歌词后立刻调用，两者不同步，会漏判。
+    const Track *curTrack =
+        mEngine != nullptr ? mEngine->currentTrack() : nullptr;
+    const std::string curId = curTrack != nullptr ? curTrack->id : std::string();
+    if (!trackId.empty() && !curId.empty() && trackId != curId) {
+      __android_log_print(ANDROID_LOG_INFO, kTag,
+                          "歌词丢弃(期间切歌): %.16s 当前=%.16s",
+                          trackId.c_str(), curId.c_str());
+      return;
+    }
     mLyricTrackId = trackId;
     mLyrics = std::move(lines);
     mCurrentLyric = 0;
@@ -1840,6 +2042,51 @@ void HudUi::setLyric(const std::string &trackId, const std::string &text) {
 void HudUi::clearCover() {
   std::lock_guard<std::mutex> lock(mMutex);
   mCoverReady = false;
+}
+
+void HudUi::setCoverLogPath(const std::string &path) {
+  std::lock_guard<std::mutex> lock(mCoverLogMutex);
+  mCoverLogPath = path;
+}
+
+void HudUi::coverLog(const char *fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  std::vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  std::lock_guard<std::mutex> lock(mCoverLogMutex);
+  // 写两份：一份在数据目录（模组自己用），一份在启动器的 minecraft 镜像目录。
+  // 后者是外部可读的固定路径，出问题时能直接把文件捞出来看。
+  // 数据目录属于应用私有，命令行没有权限读，只写那里等于白写。
+  auto appendTo = [&](const std::string &path) {
+    if (path.empty()) {
+      return;
+    }
+    struct stat st {};
+    if (::stat(path.c_str(), &st) == 0 && st.st_size > 64 * 1024) {
+      ::remove(path.c_str());
+    }
+    std::ofstream out(path, std::ios::app);
+    if (out) {
+      out << nowMs() << " " << buf << "\n";
+    }
+  };
+  appendTo(mCoverLogPath);
+  static const char *kExternalLog =
+      "/storage/emulated/0/Android/media/org.levimc.launcher/minecraft/"
+      "MusicModData/cover_debug.log";
+  if (mCoverLogPath != kExternalLog) {
+    appendTo(kExternalLog);
+  }
+}
+
+void HudUi::clearLyric() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mLyrics.clear();
+  mCurrentLyric = 0;
+  mLyricTrackId.clear();
+  mDirty = true;
 }
 
 void HudUi::clearQr() {
@@ -2111,6 +2358,181 @@ void HudUi::setLoginSubmitHandler(std::function<void()> handler) {
   mLoginSubmitHandler = std::move(handler);
 }
 
+void HudUi::updateArtistInfo(const ArtistInfo &info) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  if (!info.name.empty()) {
+    mArtistInfo.name = info.name;
+  }
+  if (!info.avatar.empty()) {
+    mArtistInfo.avatar = info.avatar;
+  }
+  if (info.songCount > 0) {
+    mArtistInfo.songCount = info.songCount;
+  }
+  if (info.albumCount > 0) {
+    mArtistInfo.albumCount = info.albumCount;
+  }
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "歌手资料回填 名字=%s",
+                      mArtistInfo.name.c_str());
+}
+
+void HudUi::setSearchAlbums(const std::vector<AlbumInfo> &list) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mSearchAlbums = list;
+  mListScroll = 0.0f;
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "搜索专辑 %zu 张",
+                      mSearchAlbums.size());
+}
+
+void HudUi::setSearchArtists(const std::vector<ArtistInfo> &list) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mSearchArtists = list;
+  mListScroll = 0.0f;
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "搜索歌手 %zu 位",
+                      mSearchArtists.size());
+}
+
+void HudUi::enterArtist(const ArtistInfo &artist) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mArtistInfo = artist;
+  mArtistView = 1;
+  mArtistTab = 0;
+  mArtistAlbums.clear();
+  mListScroll = 0.0f;
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "进入歌手页 %s id=%s",
+                      artist.name.c_str(), artist.id.c_str());
+}
+
+// 已持锁版本：只做状态变更，不再加锁。
+// 触摸路径（handleTouchLocked）必须调这个，否则同一线程二次加锁会死锁。
+void HudUi::exitArtistLocked() {
+  mArtistView = 0;
+  mArtistAlbums.clear();
+  mListScroll = 0.0f;
+  mDirty = true;
+}
+
+void HudUi::exitArtist() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  exitArtistLocked();
+}
+
+void HudUi::setArtistAlbums(const std::vector<AlbumInfo> &list) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mArtistAlbums = list;
+  mArtistTab = 1;
+  mListScroll = 0.0f;
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "歌手专辑 %zu 张",
+                      mArtistAlbums.size());
+}
+
+std::string HudUi::takeOpenAlbumRequest() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  const std::string id = mPendingAlbumId;
+  mPendingAlbumId.clear();
+  return id;
+}
+
+void HudUi::setFavoritePlaylists(const std::vector<PlaylistInfo> &list) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mFavPlaylists = list;
+  // 重新拉到歌单列表时回到第一层，避免停留在已失效的歌单里。
+  mFavView = 0;
+  mListScroll = 0.0f;
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "收藏页歌单数=%zu",
+                      mFavPlaylists.size());
+}
+
+std::string HudUi::takeOpenPlaylistRequest() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  const std::string id = mPendingOpenPlaylist;
+  mPendingOpenPlaylist.clear();
+  return id;
+}
+
+void HudUi::enterFavoritePlaylist(const std::string &id,
+                                  const std::string &name) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mFavOpenId = id;
+  mFavOpenName = name;
+  mFavView = 1;
+  mListScroll = 0.0f;
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "进入歌单 %s listid=%s",
+                      name.c_str(), id.c_str());
+}
+
+// 已持锁版本，理由同 exitArtistLocked。
+void HudUi::exitFavoritePlaylistLocked() {
+  mFavView = 0;
+  mFavOpenId.clear();
+  mFavOpenName.clear();
+  mListScroll = 0.0f;
+  mDirty = true;
+}
+
+void HudUi::exitFavoritePlaylist() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  exitFavoritePlaylistLocked();
+}
+
+void HudUi::setFavoriteToggleHandler(
+    std::function<void(const std::string &)> handler) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mFavoriteToggleHandler = std::move(handler);
+}
+
+void HudUi::setFavoriteState(bool favorited, const std::string &trackId) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  // 只接受当前曲目的结果。异步查询晚到时曲目可能已经换了，
+  // 直接覆盖会让新歌被标成上一首的收藏状态。
+  if (!trackId.empty() && !mFavoriteTrackId.empty() &&
+      trackId != mFavoriteTrackId) {
+    return;
+  }
+  if (mTrackFavorited != favorited) {
+    mTrackFavorited = favorited;
+    mDirty = true;
+  }
+}
+
+std::string HudUi::takeFavoriteQuery() {
+  if (mFavoriteQueryPending.exchange(0) == 0) {
+    return {};
+  }
+  std::lock_guard<std::mutex> lock(mMutex);
+  return mFavoriteTrackId;
+}
+
+void HudUi::toggleFavoriteOnCurrent() {
+  std::string trackId;
+  {
+    std::lock_guard<std::mutex> lock(mMutex);
+    trackId = mFavoriteTrackId;
+  }
+  if (trackId.empty()) {
+    setNotice("还没有播放中的歌曲", 2000);
+    return;
+  }
+  std::function<void(const std::string &)> handler;
+  {
+    std::lock_guard<std::mutex> lock(mMutex);
+    handler = mFavoriteToggleHandler;
+  }
+  if (!handler) {
+    setNotice("收藏功能未就绪", 2000);
+    return;
+  }
+  // 必须锁外调用：它会联网，持锁会卡住绘制线程。
+  handler(trackId);
+}
+
 void HudUi::setMenuChecker(std::function<bool()> checker) {
   std::lock_guard<std::mutex> lock(mMutex);
   mMenuChecker = std::move(checker);
@@ -2213,7 +2635,7 @@ void HudUi::loadState() {
     } catch (const std::exception &) {
     }
   }
-  // 展开面板会占掉大半屏幕，启动时一律退回迷你条，避免挡住游戏自己的按钮。
+  // 展开面板会占掉大半屏幕，启动时一律退回中面板，避免挡住游戏自己的按钮。
   if (mMode == Mode::Expanded) {
     mMode = Mode::Mini;
     placePanel();
@@ -2426,10 +2848,15 @@ bool HudUi::handleTouch(int action, float x, float y, long long timeMs) {
     std::unique_lock<std::mutex> lock(mMutex);
     // 初次进游戏、还没播过歌时，迷你条虽然存在但不该吃触摸。
     // 否则它占着屏幕右上角，会把游戏主界面的「开始」按钮吞掉。
-    // 严格以「有没有歌」为准：没歌就完全不吃触摸。
-    // 原来用 mHudArmed 兜底，但 progress.json 会恢复上次进度导致
-    // mHasTrack 为 true，门禁失效，迷你条又回来挡屏幕。
-    if (!mHasTrack) {
+    //
+    // 但门禁不能只看「有没有歌」：播完一首、队列清空之后 mHasTrack 会变假，
+    // 而面板此时仍然是可见的。旧实现一律 return false，结果是面板看得见、
+    // 却整页点不动——玩家点「退出登录」什么都不发生，看起来就像卡死。
+    // 「我的」页的透明度、主题、退出登录、领取会员与有没有歌毫无关系。
+    //
+    // 所以加上 mHudArmed 兜底：只要玩家主动打开过面板（播过歌或手动展开），
+    // 就正常派发触摸，不再整页锁死。
+    if (!mHasTrack && !mHudArmed) {
       return false;
     }
     float tx = x;
@@ -2500,6 +2927,16 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
       if (insideButton(x, y, cx0 + 88.0f + btnW, btnY, btnW, 58.0f, 6.0f,
                        6.0f)) {
         deferred = [this] { confirmLogout(); };
+        return true;
+      }
+      // 卡片外点一下等于取消。必须留这条逃逸路径：
+      // 这一段是无条件 return true 独占所有触摸的，一旦按钮命中因为
+      // 缩放或坐标换算出错，玩家就再也关不掉这个框，只能重启游戏。
+      const bool insideCard =
+          x >= cx0 && x <= cx0 + cw && y >= cy0 && y <= cy0 + ch;
+      if (!insideCard) {
+        __android_log_print(ANDROID_LOG_INFO, kTag, "退出确认框: 点卡片外取消");
+        deferred = [this] { cancelLogout(); };
         return true;
       }
     }
@@ -2806,10 +3243,14 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
       const float gap = 3.0f;
       const float expandX = mTargetX + mTargetW - padL - expandW;
       // 必须与绘制侧完全一致，否则按钮看得见点不中。
-      const float nextX = expandX - gap - btnW - (btnW + gap);
+      // 单行条只剩一个收藏键（播放顺序键已移到大面板）。
+      //   从右往左：放大 → 收藏 → 下曲 → 播放 → 上曲
+      const float smallW = 40.0f;
+      const float heartX = expandX - gap - smallW;
+      const float nextX = heartX - gap - btnW;
       const float playX = nextX - gap - playW;
       const float prevX = playX - gap - btnW;
-      const float titleW = std::max(60.0f, prevX - padL - 12.0f);
+      const float titleW = std::max(60.0f, prevX - padL - 10.0f);
 
       if (insideButton(x, y, expandX, cyMid - expandW * 0.5f, expandW,
                        expandW, 4.0f, 8.0f)) {
@@ -2820,12 +3261,20 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
         mPressedUntil = nowMs() + 140;
         mDirty = true;
         mMoved = true;   // 吞掉后面的抬手，避免在新形态上误点
-        // 这里原来写的是 Mode::Expanded，所以单行条一按放大就直接跳到大面板。
-        // 抬手路径里虽然改成了 Mode::Mini，但上面这句 mMoved = true
-        // 已经把抬手整段吞掉，那条分支永远走不到。
-        // 三层阶梯必须是：单行条 -> 中面板 -> 大面板。
+        // 三层阶梯：单行条 -> 中面板 -> 大面板。
         mMode = Mode::Mini;
         placePanel();
+        return true;
+      }
+      // 单行条不响应播放顺序切换：该按钮只在大面板里。
+      // 收藏：已收藏则取消，未收藏则加入。
+      if (insideButton(x, y, heartX, cyMid - smallW * 0.5f, smallW, smallW,
+                       4.0f, 8.0f)) {
+        mPressedAction = 12;
+        mPressedUntil = nowMs() + 140;
+        // 收藏要联网，必须在锁外执行。
+        deferred = [this] { toggleFavoriteOnCurrent(); };
+        mDirty = true;
         return true;
       }
       if (insideButton(x, y, prevX, cyMid - btnW * 0.5f, btnW, btnW, 4.0f,
@@ -3325,21 +3774,28 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
         mPendingAction.store(ActionNext);
         return true;
       }
+      // 收藏：三大件右边一格。和单行条、大面板用同一个动作。
+      // 收藏要联网，必须在锁外执行，所以走 deferred。
+      if (x >= miniCenter + 100.0f && x < miniCenter + 170.0f) {
+        mPressRectX = miniCenter + 100.0f;
+        mPressRectY = rowY;
+        mPressRectW = 70.0f;
+        mPressRectH = rowBottom - rowY;
+        mPressedUntil = nowMs() + 140;
+        mPressedAction = 12;
+        deferred = [this] { toggleFavoriteOnCurrent(); };
+        mDirty = true;
+        return true;
+      }
     }
     return true;
   }
 
   // Expanded 模式
+  // 未登录：右上角是「登录」按钮（绘制在 w-200 起的 86x44）。
   const float loginX = mTargetX + mTargetW - 206.0f;
-  if (insideButton(x, y, loginX, mTargetY + 6.0f, 92.0f, 54.0f, 6.0f, 8.0f)) {
-    if (mLoggedIn) {
-      // 已登录：点头像进账号页。
-      __android_log_print(ANDROID_LOG_INFO, kTag, "点击头像入口");
-      mLoginPage = true;
-      mSmsMode = false;
-      mDirty = true;
-      return true;
-    }
+  if (!mLoggedIn &&
+      insideButton(x, y, loginX, mTargetY + 6.0f, 92.0f, 54.0f, 6.0f, 8.0f)) {
     __android_log_print(ANDROID_LOG_INFO, kTag, "点击登录入口");
     mLoginPage = true;
     mLoginField = 0;
@@ -3351,8 +3807,57 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
     setNoticeLocked("请选择登录方式", 2000);
     return true;
   }
+  // 已登录：右上角是圆形头像，热区必须与绘制侧的 w-180 起 48x48 对齐。
+  // 单独写一个分支，不再和登录按钮共用一个矩形：两者位置不同，
+  // 共用会出现「看得见点不到」或者「点到旁边的关闭按钮」。
+  if (mLoggedIn &&
+      insideButton(x, y, mTargetX + mTargetW - 184.0f, mTargetY + 4.0f,
+                   56.0f, 56.0f, 6.0f, 8.0f)) {
+    __android_log_print(ANDROID_LOG_INFO, kTag, "点击头像入口");
+    mLoginPage = true;
+    mSmsMode = false;
+    mDirty = true;
+    return true;
+  }
 
-// 右上角叉号：收回迷你条
+// 大面板的播放模式与收藏键。
+  // 位置必须与绘制侧一致：infoX = mTargetX + 620 + coverShift。
+  // 这两个键在三大件的左右各 62px 处，三大件本身没有独立分支
+  // （整块被 hitControl 吞掉后按相对坐标分流），所以必须在这里先判，
+  // 否则点击会被三大件抢走。
+  {
+    const float coverShift2 = (mShowCover && mCoverReady) ? 250.0f : 0.0f;
+    const float baseX = mTargetX + 620.0f + coverShift2;
+    const float btnY2 = mTargetY + 318.0f;
+    // 播放方式键：infoX + 230（三大件右侧第一格），坐标与绘制侧一致。
+    // 绘制侧去掉了圆底、图标放大到 30，中心与三大件同高（y+318）。
+    // 热区 48x56 以该中心对齐，上下各留 28，不会有点不到的死区。
+    if (insideButton(x, y, baseX + 206.0f, btnY2 - 28.0f, 48.0f, 56.0f, 2.0f,
+                     4.0f)) {
+      if (mEngine != nullptr) {
+        mEngine->cyclePlayMode();
+        setNoticeLocked(
+            std::string("播放模式: ") +
+                (mEngine->playMode() == AudioEngine::PlayMode::Shuffle
+                     ? "随机"
+                     : (mEngine->playMode() == AudioEngine::PlayMode::RepeatOne
+                            ? "单曲循环"
+                            : "顺序")),
+            1800);
+      }
+      mDirty = true;
+      return true;
+    }
+    // 收藏键：infoX + 310（播放方式右边一格）。
+    if (insideButton(x, y, baseX + 288.0f, btnY2 - 22.0f, 44.0f, 44.0f, 2.0f,
+                     4.0f)) {
+      deferred = [this] { toggleFavoriteOnCurrent(); };
+      mDirty = true;
+      return true;
+    }
+  }
+
+// 右上角叉号：收回中面板
   if (insideButton(x, y, mTargetX + mTargetW - 64.0f, mTargetY + 12.0f, 48.0f,
                  52.0f, 8.0f, 10.0f)) {
     mMode = Mode::Mini;
@@ -3393,14 +3898,21 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
     return true;
   }
 
-  // 底部三个一级入口：搜索、推荐、我的。
+  // 底部四个一级入口：搜索、推荐、收藏、我的。
   const float tabY = mTargetY + mTargetH - 54.0f;
-  const float tabW = 540.0f / 3.0f;
+  const float tabW = 540.0f / 4.0f;
   if (insideButton(x, y, listLeft, tabY, 540.0f, 40.0f, 0.0f, 12.0f)) {
-    const int tab = static_cast<int>((x - listLeft) / tabW);
-    if (tab >= 0 && tab < 3) {
-      // 搜索与我的需要登录后才能使用。
-      if (!mLoggedIn && tab != 1) {
+    const int slot = static_cast<int>((x - listLeft) / tabW);
+    // 显示位次 -> Tab 枚举值，必须与绘制侧 tabEnums 一致。
+    const int slotToTab[4] = {static_cast<int>(Tab::Search),
+                              static_cast<int>(Tab::Recommend),
+                              static_cast<int>(Tab::Favorites),
+                              static_cast<int>(Tab::Mine)};
+    if (slot >= 0 && slot < 4) {
+      const int tab = slotToTab[slot];
+      // 搜索、收藏、我的需要登录后才能使用；推荐页的「探索/小众」也要登录，
+      // 但推荐页本身默认进红心，未登录时红心也是空的，所以一并拦住更清楚。
+      if (!mLoggedIn && tab != static_cast<int>(Tab::Recommend)) {
         setNoticeLocked("请先登录", 2000);
         return true;
       }
@@ -3411,6 +3923,10 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
         mTabAnimStartMs = nowMs();
       }
       mTab = static_cast<Tab>(tab);
+      // 进收藏页就重新拉一次：玩家刚点过爱心，切过来必须立刻看到结果。
+      if (mTab == Tab::Favorites) {
+        mFavoriteListRequest.store(1);
+      }
       mListScroll = 0.0f;
       mDirty = true;
       const int subTab = mRecTab;
@@ -3464,10 +3980,179 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
   }
 
 const float listX = mTargetX + 24.0f;
-  const float listY = mTargetY + 104.0f;
+  // 与绘制侧共用 listTopFor()，杜绝「画在一处、点另一处」。
+  const float listY = listTopFor();
   const float listW = 540.0f;
   // 必须与绘制侧的行高公式完全一致，否则点击会错行。
   const float rowH = std::max(54.0f, 40.0f * mFontScale);
+  // ============ 歌手页（优先于搜索页与列表行）============
+  if (mArtistView == 1) {
+    // 返回键：与绘制侧同坐标（listLeft, mTargetY+70, 96x28）。
+    if (insideButton(x, y, listLeft, mTargetY + 70.0f, 96.0f, 28.0f, 2.0f,
+                     6.0f)) {
+      __android_log_print(ANDROID_LOG_INFO, kTag, "歌手页: 返回");
+      // 本函数调用时已持 mMutex，必须用 Locked 版本，否则死锁。
+      exitArtistLocked();
+      return true;
+    }
+    // 子标签：单曲 / 专辑（listX + ai*110, y+100, 104x30）
+    for (int ai = 0; ai < 2; ++ai) {
+      if (insideButton(x, y, listLeft + ai * 110.0f, mTargetY + 100.0f, 104.0f,
+                       30.0f, 2.0f, 4.0f)) {
+        if (mArtistTab != ai) {
+          mArtistTab = ai;
+          mListScroll = 0.0f;
+          mDirty = true;
+          // 切到专辑且还没数据时，请求 main 去拉。
+          if (ai == 1 && mArtistAlbums.empty()) {
+            mPendingArtistId = mArtistInfo.id;
+            mArtistLoadRequest.store(2);
+          }
+        }
+        return true;
+      }
+    }
+    // 排序胶囊：热度 / 时间 切换，切完重新拉当前子标签。
+    if (insideButton(x, y, listLeft + 240.0f, mTargetY + 100.0f, 120.0f, 30.0f,
+                     2.0f, 4.0f)) {
+      mArtistSortByTime = !mArtistSortByTime;
+      mPendingArtistId = mArtistInfo.id;
+      mArtistLoadRequest.store(mArtistTab == 1 ? 2 : 1);
+      setNoticeLocked(mArtistSortByTime ? "排序: 按时间" : "排序: 按热度",
+                      1800);
+      mDirty = true;
+      return true;
+    }
+    // 列表行：单曲走播放，专辑进入专辑歌曲。
+    // 上沿用 listY（= listTopFor()），不能再写死常量。
+    if (insideRect(x, y, mTargetX + 24.0f, listY, 540.0f,
+                   mTargetH - 204.0f)) {
+      const float rowH2 = std::max(54.0f, 40.0f * mFontScale);
+      const int startRow3 = std::max(0, static_cast<int>(mListScroll));
+      const float shift3 =
+          (mListScroll - static_cast<float>(startRow3)) * rowH2;
+      const int row3 = static_cast<int>((y - listY + shift3) / rowH2);
+      const int idx3 = startRow3 + row3;
+      if (mArtistTab == 1) {
+        // 专辑：记下 album id，交给 main 拉歌曲。
+        if (idx3 >= 0 &&
+            static_cast<std::size_t>(idx3) < mArtistAlbums.size()) {
+          mPendingAlbumId = mArtistAlbums[idx3].id;
+          __android_log_print(ANDROID_LOG_INFO, kTag, "歌手页: 打开专辑 %s",
+                              mArtistAlbums[idx3].name.c_str());
+        }
+        return true;
+      }
+      if (idx3 >= 0 &&
+          static_cast<std::size_t>(idx3) < mTrackIds.size()) {
+        mPendingIndex.store(idx3);
+      }
+      return true;
+    }
+    return true;
+  }
+
+  // ============ 搜索页三分类标签 ============
+  // 与绘制侧同条件：没有查询词时不响应，避免点到看不见的东西。
+  if (mTab == Tab::Search && mArtistView == 0 && searchHasQuery()) {
+    for (int ki = 0; ki < 3; ++ki) {
+      if (insideButton(x, y, listLeft + ki * 180.0f, mTargetY + 96.0f, 180.0f,
+                       30.0f, 1.0f, 4.0f)) {
+        if (mSearchKind != ki) {
+          mSearchKind = ki;
+          mListScroll = 0.0f;
+          mDirty = true;
+          __android_log_print(ANDROID_LOG_INFO, kTag, "搜索分类切到 %d", ki);
+          // 已经在搜索页且有结果时，切分类要重新搜一次。
+          if (!mInputText.empty()) {
+            mPendingSearchText = mInputText;
+            mSearchSubmit.store(1);
+          }
+        }
+        return true;
+      }
+    }
+  }
+
+  // ============ 收藏页 ============
+  // 第二层的返回键：放左半边，坐标必须与绘制侧完全一致。
+  if (mTab == Tab::Favorites && mFavView == 1 &&
+      insideButton(x, y, listLeft, mTargetY + 70.0f, 96.0f, 28.0f, 2.0f,
+                   6.0f)) {
+    __android_log_print(ANDROID_LOG_INFO, kTag, "收藏页: 返回歌单列表");
+    // 本函数调用时已持 mMutex，必须用 Locked 版本，否则死锁。
+    exitFavoritePlaylistLocked();
+    // 退回后列表要恢复成歌单，通知 main 重新拉一次歌单列表。
+    mFavoriteListRequest.store(1);
+    return true;
+  }
+  // 第一层：点歌单卡片进入。
+  if (mTab == Tab::Favorites && mFavView == 0 &&
+      insideRect(x, y, listX, listY, listW, mTargetH - 168.0f)) {
+    const float listH2 = mTargetH - 168.0f;
+    const int startRow2 = std::max(0, static_cast<int>(mListScroll));
+    const float rowShift2 =
+        (mListScroll - static_cast<float>(startRow2)) * rowH;
+    const int row2 = static_cast<int>((y - listY + rowShift2) / rowH);
+    const int idx = startRow2 + row2;
+    if (idx >= 0 && static_cast<std::size_t>(idx) < mFavPlaylists.size()) {
+      const PlaylistInfo &pl = mFavPlaylists[idx];
+      mPendingOpenPlaylist = pl.id;
+      // 记住选中的歌单：之后点爱心就往这个歌单里加。
+      mFavOpenName = pl.name;
+      __android_log_print(ANDROID_LOG_INFO, kTag,
+                          "收藏页: 点歌单 %s listid=%s", pl.name.c_str(),
+                          pl.id.c_str());
+      mPressRectX = listX;
+      mPressRectY = listY + static_cast<float>(row2) * rowH - rowShift2;
+      mPressRectW = listW;
+      mPressRectH = rowH;
+      mPressedUntil = nowMs() + 140;
+      mDirty = true;
+      // 曲目由 main 拉，拉完回调 enterFavoritePlaylist。
+      return true;
+    }
+    return true;
+  }
+
+  // 搜索页「专辑」分类：点卡片进入专辑歌曲。
+  if (mTab == Tab::Search && mSearchKind == 1 &&
+      insideRect(x, y, listX, listY, listW, mTargetH - 168.0f)) {
+    const float shiftA = (mListScroll -
+                          static_cast<float>(std::max(0, static_cast<int>(mListScroll)))) *
+                         rowH;
+    const int rowA = static_cast<int>((y - listY + shiftA) / rowH);
+    const int idxA = std::max(0, static_cast<int>(mListScroll)) + rowA;
+    if (idxA >= 0 && static_cast<std::size_t>(idxA) < mSearchAlbums.size()) {
+      mPendingAlbumId = mSearchAlbums[idxA].id;
+      __android_log_print(ANDROID_LOG_INFO, kTag, "搜索页: 打开专辑 %s",
+                          mSearchAlbums[idxA].name.c_str());
+    }
+    return true;
+  }
+  // 搜索页「歌手」分类：点卡片进歌手页。
+  if (mTab == Tab::Search && mSearchKind == 2 &&
+      insideRect(x, y, listX, listY, listW, mTargetH - 168.0f)) {
+    const float shiftB = (mListScroll -
+                          static_cast<float>(std::max(0, static_cast<int>(mListScroll)))) *
+                         rowH;
+    const int rowB = static_cast<int>((y - listY + shiftB) / rowH);
+    const int idxB = std::max(0, static_cast<int>(mListScroll)) + rowB;
+    if (idxB >= 0 && static_cast<std::size_t>(idxB) < mSearchArtists.size()) {
+      mArtistInfo = mSearchArtists[idxB];
+      mArtistView = 1;
+      mArtistTab = 0;
+      mListScroll = 0.0f;
+      mDirty = true;
+      // 请求 main 拉歌手资料与歌曲。
+      mPendingArtistId = mArtistInfo.id;
+      mArtistLoadRequest.store(1);
+      __android_log_print(ANDROID_LOG_INFO, kTag, "搜索页: 进入歌手 %s",
+                          mArtistInfo.name.c_str());
+    }
+    return true;
+  }
+
   if (insideRect(x, y, listX, listY, listW, mTargetH - 168.0f)) {
     // 必须和绘制用同一套小数偏移：绘制是
     //   ry = listY + k*rowH - rowShift
@@ -3640,12 +4325,16 @@ bool HudUi::submit() {
     const float playW = 46.0f;
     const float gap = 3.0f;
     const float expandX = x + w - padL - expandW;
-    // 三大件整体再左移一个按钮位：原来下曲和放大键之间只隔 3 像素，
-    // 挤在一起既难看也容易误触。
-    const float nextX = expandX - gap - btnW - (btnW + gap);
+    // 新增两个小按钮，宽 34（比三大件小一号）：
+    //   小模式键放在「上曲」左边，爱心放在「下曲」右边。
+    // 与触摸侧完全一致：单行条只有收藏一个键。
+    //   从右往左：放大 → 收藏 → 下曲 → 播放 → 上曲
+    const float smallW = 40.0f;
+    const float heartX = expandX - gap - smallW;
+    const float nextX = heartX - gap - btnW;
     const float playX = nextX - gap - playW;
     const float prevX = playX - gap - btnW;
-    const float titleW = std::max(60.0f, prevX - padL - 12.0f);
+    const float titleW = std::max(60.0f, prevX - padL - 10.0f);
     const float titleSize = 19.0f * mFontScale;
 
     // 歌名：超出宽度自动滚动。
@@ -3653,6 +4342,7 @@ bool HudUi::submit() {
                mTitle.empty() ? std::string("未在播放") : mTitle, kTextMain,
                nowMs());
 
+    // 单行条不放播放顺序按钮：它只在大面板里出现。
     // 上曲
     if (mPressedAction == 6) {
       roundRect(out, prevX - 4.0f, cyMid - 26.0f, btnW + 8.0f, 52.0f, 12.0f,
@@ -3681,6 +4371,16 @@ bool HudUi::submit() {
                 kRowActive);
     }
     iconNext(out, nextX + btnW * 0.5f, cyMid, 23.0f, kTextMain);
+
+    // 收藏（爱心）：已收藏为实心强调色，未收藏为空心文字色。
+    {
+      if (mPressedAction == 12) {
+        circleFill(out, heartX + smallW * 0.5f, cyMid, smallW - 4.0f,
+                   kRowActive);
+      }
+      glyphHeart(out, heartX + smallW * 0.5f, cyMid, 18.0f, mTrackFavorited,
+                 mTrackFavorited ? kAccent : kTextDim);
+    }
 
     // 放大：展开为完整面板
     if (mPressedAction == 9) {
@@ -3758,6 +4458,15 @@ bool HudUi::submit() {
       }
     }
     iconNext(out, miniCenter + kMiniKeyGap, rowY, 30.0f, kTextMain);
+    // 收藏爱心：中面板三大件右边一格，间距与三大件相同。
+    // 单行条太窄放不下这个键，大面板本来就有，所以只在中面板补。
+    // 已收藏时用强调色实心，未收藏是暗色空心，一眼能分辨状态。
+    {
+      const float hcx = miniCenter + kMiniKeyGap * 2.0f;
+      circleFill(out, hcx, rowY, 40.0f, 0x1A000000);
+      glyphHeart(out, hcx, rowY, 20.0f, mTrackFavorited,
+                 mTrackFavorited ? kAccent : kTextDim);
+    }
     if (nowMs() < mPressedUntil && mPressRectW > 0.0f) {
       // 按下时先向外弹出一圈淡光，再叠主色填充，形成弹一下的手感。
       const float left = static_cast<float>(mPressedUntil - nowMs()) / 140.0f;
@@ -3796,24 +4505,44 @@ bool HudUi::submit() {
     const char *recSubNames[3] = {"红心", "探索", "小众"};
     const char *pageName = (mTab == Tab::Search) ? tr("搜索", "Search")
                             : (mTab == Tab::Mine) ? tr("我的", "Mine")
+                            : (mTab == Tab::Favorites) ? tr("收藏", "Favorites")
                             : recSubNames[std::min(2, std::max(0, mRecTab))];
     text(out, x + 24.0f, y + 14.0f, 26.0f * mFontScale, kTextMain, pageName);
     // 搜索页的副标题会与下方输入框（y+52）重叠，这一页不画。
     if (mTab != Tab::Search) {
       text(out, x + 24.0f, y + 46.0f, 14.0f * mFontScale, kTextDim,
            (mTab == Tab::Mine) ? std::string("账号与设置")
-                               : std::to_string(mTrackCount) + " 首曲目");
+           : (mTab == Tab::Favorites)
+               // 第一层列的是歌单，副标题必须说歌单数。
+               // 之前这里用了 mTrackCount，显示成上一页遗留的「30 首收藏」。
+               ? ((mFavView == 0)
+                      ? (mFavPlaylists.empty()
+                             ? std::string("还没有歌单")
+                             : std::to_string(mFavPlaylists.size()) +
+                                   " 个歌单")
+                      : (mTrackCount == 0
+                             ? std::string("这个歌单还是空的")
+                             : std::to_string(mTrackCount) + " 首收藏"))
+               : std::to_string(mTrackCount) + " 首曲目");
     }
     if (mLoggedIn) {
-      // 已登录：右上角换成头像，不再显示「登录」。
-      rect(out, x + w - 132.0f, y + 8.0f, 48.0f, 48.0f, 0xFF3C5170);
-      rect(out, x + w - 132.0f, y + 8.0f, 48.0f, 2.0f, kAccent);
-      // 原来这里画账号昵称的首字符，玩家看到的是一个莫名其妙的数字
-      // （昵称以数字开头时就显示成「2」）。改成中性人形图标，
-      // 一眼能看出是头像，不会被误读成状态或数量。
-      {
-        const float ax = x + w - 132.0f;
-        const float ay = y + 8.0f;
+      // 已登录：右上角画圆形头像。
+      // 位置从 w-132 再往左挪一个按钮位（48 + 12），和关闭按钮拉开，
+      // 两个热区不再互相挨着，点错的概率明显下降。
+      const float ax = x + w - 180.0f;
+      const float ay = y + 8.0f;
+      // 先画略大的强调色圆、再画内圆，形成 2px 描边。
+      // 头像图本身四角是全透明的，底下必须有底色，否则会露出面板背景，
+      // 看起来像「头像缺了一块」。
+      circleFill(out, ax + 24.0f, ay + 24.0f, 52.0f, kAccent);
+      circleFill(out, ax + 24.0f, ay + 24.0f, 48.0f, 0xFF3C5170);
+      if (mAvatarReady) {
+        // 圆形裁切过的真实头像，左上角与圆形底色完全对齐。
+        image(out, ax, ay, 48.0f, 48.0f, avatarId().c_str());
+      } else {
+        // 还没拿到头像：先画中性人形图标，不显示任何字符。
+        // 以前这里是昵称首字符，账号 id 是数字时就显示成一个莫名其妙的
+        // 「二」，玩家以为是 bug。人形图标不会被误读成状态或数量。
         circleFill(out, ax + 24.0f, ay + 17.0f, 15.0f, 0xFFDCE6F2);
         roundRect(out, ax + 12.0f, ay + 29.0f, 24.0f, 13.0f, 6.5f,
                   0xFFDCE6F2);
@@ -4063,7 +4792,8 @@ bool HudUi::submit() {
     const float listShift = pageSlide + recSlide;
     // 列表：上方留给输入框，下方留给分页栏
     const float listX = x + 24.0f + listShift;
-    const float listY = y + 104.0f;
+    // 列表区上沿统一由 listTopFor() 决定，绘制与触摸共用同一套坐标。
+    const float listY = listTopFor();
     const float listW = 540.0f;
     // 列表只在搜索页和推荐页绘制。「我的」页没有列表，
     // 原来无条件绘制，导致切到我的页时歌单和偏好按钮叠在一起。
@@ -4097,13 +4827,146 @@ bool HudUi::submit() {
       if (i < 0) {
         continue;
       }
-      if (static_cast<std::size_t>(i) >= mTrackCount) {
+      // 行数按当前页取：各页的数据源不同，不能一律用 mTrackCount。
+      std::size_t rowLimit = mTrackCount;
+      if (mTab == Tab::Favorites && mFavView == 0) {
+        rowLimit = mFavPlaylists.size();
+      } else if (mArtistView == 1 && mArtistTab == 1) {
+        rowLimit = mArtistAlbums.size();
+      } else if (mTab == Tab::Search && mArtistView == 0 && mSearchKind == 1) {
+        rowLimit = mSearchAlbums.size();
+      } else if (mTab == Tab::Search && mArtistView == 0 && mSearchKind == 2) {
+        rowLimit = mSearchArtists.size();
+      }
+      if (static_cast<std::size_t>(i) >= rowLimit) {
         break;
       }
       const float ry = listY + static_cast<float>(k) * rowH - rowShift;
       // 宿主没有裁剪能力：整行落在列表区外就整行不画，
       // 否则会压到输入框、分页栏或右侧播放区（穿模）。
       if (ry >= listY + listBgH - 0.5f || ry + rowH <= listY + 0.5f) {
+        continue;
+      }
+      // 歌手页「专辑」子标签：画专辑卡片。
+      if (mArtistView == 1 && mArtistTab == 1) {
+        const int ai = startRow + k;
+        if (ai < 0 ||
+            static_cast<std::size_t>(ai) >= mArtistAlbums.size()) {
+          continue;
+        }
+        const bool whole2 =
+            (ry >= listY - 0.5f) && (ry + rowH <= listY + listBgH + 0.5f);
+        if (!whole2) {
+          continue;
+        }
+        const AlbumInfo &al = mArtistAlbums[ai];
+        roundRect(out, listX + 6.0f, ry + 4.0f, listW - 12.0f, rowH - 8.0f,
+                  kRadiusBtn, 0x22000000);
+        rect(out, listX + 16.0f, ry + 10.0f, 3.0f, rowH - 20.0f, kAccent);
+        marqueeFit(out, listX + 30.0f, ry + 6.0f * mFontScale,
+                   17.0f * mFontScale, listW - 120.0f, al.name, kTextMain,
+                   nowMs() + ai * 350);
+        text(out, listX + 30.0f, ry + rowH - 16.0f * mFontScale,
+             13.0f * mFontScale, kTextDim, tr("专辑", "Album"));
+        triFill(out, listX + listW - 34.0f, ry + rowH * 0.5f - 7.0f,
+                listX + listW - 34.0f, ry + rowH * 0.5f + 7.0f,
+                listX + listW - 24.0f, ry + rowH * 0.5f, kTextDim);
+        continue;
+      }
+      // 搜索页「专辑」分类：同样画专辑卡片，数据来自 mSearchAlbums。
+      if (mTab == Tab::Search && mArtistView == 0 && mSearchKind == 1) {
+        const int ai = startRow + k;
+        if (ai < 0 ||
+            static_cast<std::size_t>(ai) >= mSearchAlbums.size()) {
+          continue;
+        }
+        const bool whole3 =
+            (ry >= listY - 0.5f) && (ry + rowH <= listY + listBgH + 0.5f);
+        if (!whole3) {
+          continue;
+        }
+        const AlbumInfo &al = mSearchAlbums[ai];
+        roundRect(out, listX + 6.0f, ry + 4.0f, listW - 12.0f, rowH - 8.0f,
+                  kRadiusBtn, 0x22000000);
+        rect(out, listX + 16.0f, ry + 10.0f, 3.0f, rowH - 20.0f, 0x668DBDA2);
+        marqueeFit(out, listX + 30.0f, ry + 5.0f * mFontScale,
+                   17.0f * mFontScale, listW - 120.0f, al.name, kTextMain,
+                   nowMs() + ai * 350);
+        if (!al.artist.empty()) {
+          marqueeFit(out, listX + 30.0f, ry + rowH - 17.0f * mFontScale,
+                     13.0f * mFontScale, listW - 120.0f, al.artist, kTextDim,
+                     nowMs() + ai * 350);
+        }
+        triFill(out, listX + listW - 34.0f, ry + rowH * 0.5f - 7.0f,
+                listX + listW - 34.0f, ry + rowH * 0.5f + 7.0f,
+                listX + listW - 24.0f, ry + rowH * 0.5f, kTextDim);
+        continue;
+      }
+      // 搜索页「歌手」分类：画歌手卡片。
+      if (mTab == Tab::Search && mArtistView == 0 && mSearchKind == 2) {
+        const int ai = startRow + k;
+        if (ai < 0 ||
+            static_cast<std::size_t>(ai) >= mSearchArtists.size()) {
+          continue;
+        }
+        const bool whole4 =
+            (ry >= listY - 0.5f) && (ry + rowH <= listY + listBgH + 0.5f);
+        if (!whole4) {
+          continue;
+        }
+        const ArtistInfo &ar = mSearchArtists[ai];
+        roundRect(out, listX + 6.0f, ry + 4.0f, listW - 12.0f, rowH - 8.0f,
+                  kRadiusBtn, 0x22000000);
+        // 头像位：没做图片加载，用圆形色块 + 名字首字之外的纯色块，
+        // 避免又出现「显示一个莫名其妙的字」那种情况。
+        circleFill(out, listX + 40.0f, ry + rowH * 0.5f, rowH - 22.0f,
+                   0xFF3C5170);
+        marqueeFit(out, listX + 72.0f, ry + 6.0f * mFontScale,
+                   17.0f * mFontScale, listW - 140.0f, ar.name, kTextMain,
+                   nowMs() + ai * 350);
+        if (ar.songCount > 0) {
+          text(out, listX + 72.0f, ry + rowH - 16.0f * mFontScale,
+               13.0f * mFontScale, kTextDim,
+               std::to_string(ar.songCount) + " 首");
+        }
+        triFill(out, listX + listW - 34.0f, ry + rowH * 0.5f - 7.0f,
+                listX + listW - 34.0f, ry + rowH * 0.5f + 7.0f,
+                listX + listW - 24.0f, ry + rowH * 0.5f, kTextDim);
+        continue;
+      }
+      // 收藏页第一层：这里画的是「歌单卡片」而不是歌曲行。
+      // 数据来自 mFavPlaylists，行数与 mTrackCount 无关，所以单独成块。
+      if (mTab == Tab::Favorites && mFavView == 0) {
+        const int pi = startRow + k;
+        if (pi < 0 || static_cast<std::size_t>(pi) >= mFavPlaylists.size()) {
+          continue;
+        }
+        const bool whole =
+            (ry >= listY - 0.5f) && (ry + rowH <= listY + listBgH + 0.5f);
+        // 分隔线照旧，卡片本身有底，所以只在未整行时跳过
+        if (!whole) {
+          continue;
+        }
+        const PlaylistInfo &pl = mFavPlaylists[pi];
+        // 卡片：整行玻璃底 + 左侧方形占位（歌单封面还没做，先用主色块）。
+        roundRect(out, listX + 6.0f, ry + 4.0f, listW - 12.0f, rowH - 8.0f,
+                  kRadiusBtn, 0x22000000);
+        rect(out, listX + 16.0f, ry + 10.0f, 3.0f, rowH - 20.0f,
+             pl.isDefault ? kAccent : 0x668DBDA2);
+        // 歌单名
+        marqueeFit(out, listX + 30.0f, ry + 6.0f * mFontScale,
+                   17.0f * mFontScale, listW - 120.0f, pl.name, kTextMain,
+                   nowMs() + pi * 350);
+        // 曲目数 + 类型
+        const std::string meta =
+            std::to_string(pl.count) + " 首" +
+            (pl.isDefault ? std::string("  · 默认收藏") : std::string());
+        text(out, listX + 30.0f, ry + rowH - 16.0f * mFontScale,
+             13.0f * mFontScale, kTextDim, meta);
+        // 右侧进入箭头
+        triFill(out, listX + listW - 34.0f, ry + rowH * 0.5f - 7.0f,
+                listX + listW - 34.0f, ry + rowH * 0.5f + 7.0f,
+                listX + listW - 24.0f, ry + rowH * 0.5f, kTextDim);
         continue;
       }
       // 文字无法裁剪，只有整行都在列表区内才画；
@@ -4230,23 +5093,107 @@ bool HudUi::submit() {
     }
     }
 
-    // 分页栏
-    const char *tabNames[3] = {tr("搜索", "Search"), tr("推荐", "Recommend"),
-                               tr("我的", "Mine")};
+    // 搜索页三分类标签：单曲 / 专辑 / 歌手。默认单曲。
+    // 搜索框是空的时候不显示——什么都没搜，摆一排分类没有意义，
+    // 而且会把列表区往下挤，看起来像「面板自己展开了一堆东西」。
+    if (mTab == Tab::Search && mArtistView == 0 && searchHasQuery()) {
+      const char *kinds[3] = {tr("单曲", "Songs"), tr("专辑", "Albums"),
+                              tr("歌手", "Artists")};
+      const float kindY = y + 96.0f;
+      const float kindW = 540.0f / 3.0f;
+      for (int ki = 0; ki < 3; ++ki) {
+        const float kx = listX + ki * kindW;
+        const bool active = (mSearchKind == ki);
+        if (active) {
+          roundRect(out, kx + 4.0f, kindY, kindW - 8.0f, 30.0f, kRadiusBtn,
+                    0x4206644B);
+          rect(out, kx + 12.0f, kindY + 30.0f, kindW - 24.0f, 2.0f, kAccent);
+        }
+        const float kw = estimateTextWidth(kinds[ki], 16.0f * mFontScale);
+        text(out, kx + (kindW - kw) * 0.5f, kindY + 6.0f, 16.0f * mFontScale,
+             active ? kTextMain : kTextDim, kinds[ki]);
+      }
+    }
+
+    // 歌手页页头。左侧返回键用和收藏页第二层相同的位置语言。
+    if (mArtistView == 1) {
+      const float backX = listX;
+      const float backY = y + 70.0f;
+      rect(out, backX, backY, 96.0f, 28.0f, 0x33FFFFFF);
+      triFill(out, backX + 12.0f, backY + 9.0f, backX + 12.0f, backY + 19.0f,
+              backX + 6.0f, backY + 14.0f, kTextMain);
+      text(out, backX + 22.0f, backY + 5.0f, 15.0f * mFontScale, kTextMain,
+           tr("返回", "Back"));
+      // 歌手名
+      marqueeFit(out, backX + 108.0f, backY + 4.0f, 17.0f * mFontScale,
+                 260.0f,
+                 mArtistInfo.name.empty() ? std::string("歌手")
+                                          : mArtistInfo.name,
+                 kAccent, nowMs());
+      // 子标签：单曲 / 专辑
+      const char *tabs2[2] = {tr("单曲", "Songs"), tr("专辑", "Albums")};
+      const float atY = y + 100.0f;
+      for (int ai = 0; ai < 2; ++ai) {
+        const float ax = listX + ai * 110.0f;
+        const bool act = (mArtistTab == ai);
+        if (act) {
+          roundRect(out, ax, atY, 104.0f, 30.0f, kRadiusBtn, 0x4206644B);
+          rect(out, ax + 12.0f, atY + 30.0f, 80.0f, 2.0f, kAccent);
+        }
+        text(out, ax + 16.0f, atY + 6.0f, 16.0f * mFontScale,
+             act ? kTextMain : kTextDim, tabs2[ai]);
+      }
+      // 排序切换：右侧一个胶囊，点一下在「热度/时间」之间切
+      {
+        const float sortX = listX + 240.0f;
+        roundRect(out, sortX, atY, 120.0f, 30.0f, 15.0f, 0x2A000000);
+        text(out, sortX + 14.0f, atY + 6.0f, 15.0f * mFontScale, kTextMain,
+             mArtistSortByTime ? tr("按时间", "By time")
+                               : tr("按热度", "By hot"));
+      }
+    }
+
+    // 收藏页第二层的返回按钮。放左半边：
+    // 位置在副标题下方、列表区上沿之上，不会和标题、头像、关闭键冲突。
+    // 只在第二层（歌曲列表）出现；第一层是根层级，没有上级可返回。
+    if (mTab == Tab::Favorites && mFavView == 1) {
+      const float backX = listX;
+      const float backY = y + 70.0f;
+      rect(out, backX, backY, 96.0f, 28.0f, 0x33FFFFFF);
+      triFill(out, backX + 12.0f, backY + 9.0f, backX + 12.0f, backY + 19.0f,
+              backX + 6.0f, backY + 14.0f, kTextMain);
+      text(out, backX + 22.0f, backY + 5.0f, 15.0f * mFontScale, kTextMain,
+           tr("返回", "Back"));
+      // 当前歌单名，跟在返回键右边，让玩家知道自己在哪一层。
+      marqueeFit(out, backX + 108.0f, backY + 5.0f, 15.0f * mFontScale,
+                 360.0f, mFavOpenName, kAccent, nowMs());
+    }
+
+    // 分页栏：4 项。显示顺序 搜索、推荐、收藏、我的。
+    const char *tabNames[4] = {tr("搜索", "Search"), tr("推荐", "Recommend"),
+                               tr("收藏", "Favorites"), tr("我的", "Mine")};
+    // 显示位次 -> Tab 枚举值。收藏在枚举里是 3，但显示排第三位。
+    const int tabEnums[4] = {static_cast<int>(Tab::Search),
+                             static_cast<int>(Tab::Recommend),
+                             static_cast<int>(Tab::Favorites),
+                             static_cast<int>(Tab::Mine)};
     const float tabY = y + h - 54.0f;
-    const float tabW = listW / 3.0f;
+    const float tabW = listW / 4.0f;
     rect(out, listX, tabY - 4.0f, listW, 52.0f, 0x1C000000);
     rect(out, listX, tabY - 4.0f, listW, 1.0f, 0x16FFFFFF);
-    for (int ti = 0; ti < 3; ++ti) {
+    for (int ti = 0; ti < 4; ++ti) {
       const float tx = listX + ti * tabW;
-      const bool activeTab = (static_cast<int>(mTab) == ti);
+      const bool activeTab = (static_cast<int>(mTab) == tabEnums[ti]);
       if (activeTab) {
         roundRect(out, tx + 4.0f, tabY, tabW - 8.0f, 38.0f, kRadiusBtn,
                   0x4206644B);
-        rect(out, tx + 14.0f, tabY + 40.0f, tabW - 28.0f, 3.0f, kAccent);
+        rect(out, tx + 10.0f, tabY + 40.0f, tabW - 20.0f, 3.0f, kAccent);
       }
-      text(out, tx + 26.0f, tabY + 10.0f, 17.0f * mFontScale,
-           activeTab ? kTextMain : kTextDim, tabNames[ti]);
+      // 4 列比 3 列窄，文字改成居中，靠 26px 固定左边距会被截断。
+      const float labelW =
+          estimateTextWidth(tabNames[ti], 17.0f * mFontScale);
+      text(out, tx + (tabW - labelW) * 0.5f, tabY + 10.0f,
+           17.0f * mFontScale, activeTab ? kTextMain : kTextDim, tabNames[ti]);
     }
 
     if (drawList) {  // 播放区与歌词只在搜索/推荐页绘制
@@ -4304,6 +5251,26 @@ bool HudUi::submit() {
            fmtTime(mPositionMs) + " / " + fmtTime(mDurationMs));
     }
 
+    // 播放模式键：去掉圆底、图标放大到 30。
+    // 纵向中心保持 y+318，和三大件在同一条水平线上 —— 上一版上移到 y+306
+    // 看起来是歪的，已按反馈调回。
+    {
+      const int mode =
+          mEngine != nullptr ? static_cast<int>(mEngine->playMode()) : 0;
+      // 三大键右边依次是：播放方式 → 收藏（用户指定的顺序）。
+      const float mcx = infoX + 230.0f;
+      const float mcy = y + 318.0f;
+      // 顺序播放是「默认态」，用主文字色；随机和单曲循环用强调色，
+      // 这样一眼能看出「现在的模式和默认不一样」。
+      const std::uint32_t modeColor = (mode == 0) ? kTextMain : kAccent;
+      if (mode == 1) {
+        glyphModeShuffle(out, mcx, mcy, 30.0f, modeColor);
+      } else if (mode == 2) {
+        glyphModeRepeatOne(out, mcx, mcy, 30.0f, modeColor);
+      } else {
+        glyphModeSequential(out, mcx, mcy, 30.0f, modeColor);
+      }
+    }
     iconPrev(out, infoX + 30.0f, y + 318.0f, 34.0f, kTextMain);
     // 播放/暂停：实心强调色圆 + 深色图标，和中面板保持同一套语言。
     // 上一首/下一首仍是纯图标，不加底。
@@ -4319,6 +5286,16 @@ bool HudUi::submit() {
       }
     }
     iconNext(out, infoX + 160.0f, y + 318.0f, 34.0f, kTextMain);
+
+    // 收藏爱心：三大件右侧 62px，与左侧模式键对称。
+    {
+      // 收藏在播放方式右边一格。
+      const float hcx = infoX + 310.0f;
+      const float hcy = y + 318.0f;
+      circleFill(out, hcx, hcy, 44.0f, 0x1A000000);
+      glyphHeart(out, hcx, hcy, 22.0f, mTrackFavorited,
+                 mTrackFavorited ? kAccent : kTextDim);
+    }
 
     if (!mLyrics.empty()) {
       const std::size_t index =
@@ -4429,20 +5406,48 @@ bool HudUi::submit() {
                              line.charStarts.size() == line.chars.size() &&
                              line.charEnds.size() == line.chars.size();
           // 先求颜色前沿：由当前字的真实时间轴决定，字慢就推得慢。
+          //
+          // 旧实现是「顺序扫，遇到第一个还没开始唱的字就 break」。
+          // 一句歌词分成两段（KRC 里同一行有多个 <offset,duration,0> 标签，
+          // 或多行时间戳衔接）时，第二段首字的 cs 明显晚于第一段末字的 ce，
+          // 于是遍历到它就不满足任何条件、直接 break。跨段拼接的时间戳还
+          // 常常不是严格单调，导致 front 卡在第一段末尾不再前进——这正是
+          // 「一句两段只铺到第一段」的现象。
+          //
+          // 现在改成两遍扫描：
+          //   第一遍找「最后一个已经唱完的字」，用它的右边界作已唱前沿；
+          //   第二遍找「当前正在唱的那个字」，对它做插值。
+          // 这样时间戳非单调也不会卡住（取的是最大右边界，不是遍历终点）。
           float front = 0.0f;
           if (timed) {
-            for (std::size_t g = 0; g < line.chars.size(); ++g) {
+            const std::size_t n = line.chars.size();
+            std::size_t sungEnd = 0;   // 已唱完的字有几个
+            for (std::size_t g = 0; g < n; ++g) {
               const long long cs = line.charStarts[g];
               const long long ce = line.charEnds[g];
-              const float left = (g == 0) ? 0.0f : line.charEndsPx[g - 1];
-              const float right = line.charEndsPx[g];
-              // ce <= cs 是异常时间戳（时长为 0 或负）。
-              // 这种字不能当作「已唱完」处理，否则 front 会误跳。
-              if (ce > cs && lyricPos >= ce) {
-                front = right;
-                continue;
+              // ce <= cs 是异常时间戳（时长为 0 或负），按「未知」跳过判断，
+              // 但仍计入已唱，避免整句卡死。
+              if (lyricPos >= ce || (ce <= cs && lyricPos >= cs)) {
+                sungEnd = g + 1;
               }
-              if (lyricPos > cs && ce > cs) {
+            }
+            if (sungEnd > 0) {
+              front = line.charEndsPx[sungEnd - 1];
+            }
+            // 正在唱的那个字：优先取下标 sungEnd（紧随已唱之后）。
+            // 若它因时间戳异常而无法插值，就再往后找一个「正在区间内」的字。
+            for (std::size_t g = sungEnd; g < n; ++g) {
+              const long long cs = line.charStarts[g];
+              const long long ce = line.charEnds[g];
+              if (ce <= cs) {
+                continue;   // 时长为 0 或负，跳过
+              }
+              if (lyricPos < cs) {
+                break;      // 还没到它，后续更晚（按正常排序）
+              }
+              if (lyricPos < ce) {
+                const float left = (g == 0) ? 0.0f : line.charEndsPx[g - 1];
+                const float right = line.charEndsPx[g];
                 front = left + (right - left) *
                                    static_cast<float>(lyricPos - cs) /
                                    static_cast<float>(ce - cs);
@@ -4499,6 +5504,21 @@ bool HudUi::submit() {
                   k += step;
                 }
                 splitByte = bytePos;
+              }
+            }
+            // 诊断：一句被拆成多段时（KRC 同段标签数 > 1），
+            // 打一次真实时间轴，用来核对「两段只铺第一段」是否真的修好。
+            // 只在纵向位置落在中线那一行打，避免每帧刷屏。
+            if (i == index && std::fabs(ly - midY) < 4.0f) {
+              static long long lastDiagMs = 0;
+              const long long diagNow = nowMs();
+              if (diagNow - lastDiagMs > 900) {
+                lastDiagMs = diagNow;
+                __android_log_print(
+                    ANDROID_LOG_INFO, kTag,
+                    "歌词推色 行=%zu 字=%zu 已唱=%zu 前沿=%.0f 总宽=%.0f 位置=%lld",
+                    index, line.chars.size(), splitByte, frontClamped,
+                    line.totalWidth, lyricPos);
               }
             }
             const std::string sung = line.text.substr(0, splitByte);
@@ -4704,19 +5724,9 @@ bool HudUi::submit() {
     // 页头只由前面的统一入口绘制一次。
     // 这里原本又画了一遍标题与副标题，坐标与前面完全相同，
     // 两次叠字会让笔画变粗发糊（截图上像重影）。
-    if (mMode == Mode::Expanded && !mLoginPage) {
-      if (mLoggedIn) {
-        rect(out, x + w - 132.0f, y + 8.0f, 48.0f, 48.0f, 0xFF3C5170);
-        rect(out, x + w - 132.0f, y + 8.0f, 48.0f, 2.0f, kAccent);
-        text(out, x + w - 118.0f, y + 20.0f, 20.0f * mFontScale, kTextMain,
-             firstChar(mUserLabel));
-      } else {
-        rect(out, x + w - 200.0f, y + 10.0f, 86.0f, 44.0f, 0xFF2E3B4E);
-        rect(out, x + w - 200.0f, y + 10.0f, 86.0f, 2.0f, kAccent);
-        text(out, x + w - 182.0f, y + 22.0f, 18.0f * mFontScale, kAccent,
-             "登录");
-      }
-    }
+    // 这里原本又画了一遍右上角的头像与「登录」按钮，坐标与页头统一入口
+    // 完全相同。第二遍用不透明底色把第一遍盖掉，再在中间写一个昵称首字符，
+    // 账号 id 是数字时就显示成「二」。已整块删除，右上角只由页头画一次。
     // 切页动画：内容淡入 + 轻微横向滑入，缓出曲线，不是匀速。
   {
     const long long tNow = nowMs();
@@ -4882,6 +5892,15 @@ void HudUi::refresh(bool syncEngine) {
           mArtist = cur->artist;
           mDirty = true;
         }
+        // 收藏状态跟着当前曲目走。曲目一换就先把标记清掉，
+        // 等 main 查询结果回来再点亮，避免旧状态套到新歌上。
+        if (cur != nullptr && mFavoriteTrackId != cur->id) {
+          mFavoriteTrackId = cur->id;
+          mTrackFavorited = false;
+          mDirty = true;
+          // 记一个待查询标记，由 main 在下一拍发起查询。
+          mFavoriteQueryPending.store(true);
+        }
       }
       if (syncEngine) {
         const Track *cur = mEngine->currentTrack();
@@ -4957,11 +5976,13 @@ void HudUi::refresh(bool syncEngine) {
       // 否则长歌名在迷你条上不会触发滚动刷新。
       const bool bar = (mMode == Mode::Bar);
       const bool mini = (mMode == Mode::Mini);
-      // 单行条的标题宽 = 面板宽 - 左边距12 - 右侧整串(放大40+间隙3+下曲40
-      // +让位43+间隙3+播放46+间隙3+上曲40) - 右留白12 - 中缝12 = 面板宽-254。
+      // 单行条标题宽 = 面板宽 - 左边距12 - 右侧整串 - 中缝12。
+      // 右侧整串（从右往左）：放大40 + 3 + 爱心40 + 3 + 模式40 + 3
+      //   + 下曲40 + 3 + 播放46 + 3 + 上曲40 = 261。
+      // 可用宽 = 面板宽 - 12 - 261 - 12 = 面板宽 - 285。
       // 这个数必须跟着绘制侧一起改，否则会出现「判定放得下、实际被截断」。
       const float titleSize = (bar ? 19.0f : (mini ? 27.0f : 30.0f)) * mFontScale;
-      const float avail = bar ? (mPanelW - 254.0f)
+      const float avail = bar ? (mPanelW - 285.0f)
                               : (mini ? (mPanelW - 78.0f) : (mPanelW - 500.0f));
       const bool overflow = estimateTextWidth(mTitle, titleSize) * 1.03f > avail;
       mTitleScrolling.store(overflow);
