@@ -92,6 +92,24 @@ std::size_t AudioEngine::appendQueue(const std::vector<Track> &tracks) {
   return oldSize;
 }
 
+bool AudioEngine::insertNext(const Track &track) {
+  if (track.id.empty()) {
+    return false;
+  }
+  if (mTracks.empty()) {
+    mTracks.push_back(track);
+    mIndex = 0;
+    return true;
+  }
+  // 插到当前曲目之后。mIndex 保持不变，正在播的这首歌不会被中断。
+  std::size_t pos = mIndex + 1;
+  if (pos > mTracks.size()) {
+    pos = mTracks.size();
+  }
+  mTracks.insert(mTracks.begin() + static_cast<std::ptrdiff_t>(pos), track);
+  return true;
+}
+
 bool AudioEngine::playIndex(std::size_t index) {
   // 换曲时清掉卡死计数，避免上一首的累计影响这一首。
   mStallTicks = 0;

@@ -34,6 +34,9 @@ public:
                            const std::string &currentId);
   // 追加曲目并去重，返回追加前的队列长度。
   std::size_t appendQueue(const std::vector<Track> &tracks);
+  // 把一首歌插到「当前播放的下一首」，当前正在播的曲目不受影响。
+  // 队列为空时直接作为唯一曲目。
+  bool insertNext(const Track &track);
   bool takeNeedMore() {
     const bool value = mNeedMore;
     mNeedMore = false;

@@ -13,6 +13,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -478,7 +479,7 @@ public:
       // 版本戳：每次启动写一次，用于确认当前加载的是哪一版模组。
       std::ofstream stamp(mDataDir + "/build_stamp.txt");
       if (stamp) {
-        stamp << "ui_version=55\nbuild=2026-11-26 17:05\n"
+        stamp << "ui_version=67\nbuild=2026-11-28 01:05\n"
                  "fix=modid_from_dirname,dark_theme_default,cover_toggle_batch,"
                  "cover_switch_saved,marquee_slow_smooth,ascii_width_062,"
                  "bar_3btn_shift,expanded_fixed_no_drag,modmenu_pos_removed,"
@@ -490,7 +491,7 @@ public:
                  "artist_page,sort_toggle,list_top_unified,"
                  "search_kind_gated,bar_btns_right40,queue_empty_guard,"
                  "skip_jitter_guard,empty_playlist_ok,isdef_default,"
-                 "fav_fileids_del,playlist_pagesize_fix,exp_btn_order,fix_back_deadlock,fav_status_data,no_playlist_drift,cover_lyric_guard,restore_mini,bar_no_mode_btn,lyric_engine_guard,lyric_thread_clear,remove_fav_status,mixsongid_field,mini_heart_btn,cover_thread_retry,cover_img_validate,mode_btn_flat,cover_debug_log,mode_btn_align,cover_id_reuse\n";
+                 "fav_fileids_del,playlist_pagesize_fix,exp_btn_order,fix_back_deadlock,fav_status_data,no_playlist_drift,cover_lyric_guard,restore_mini,bar_no_mode_btn,lyric_engine_guard,lyric_thread_clear,remove_fav_status,mixsongid_field,mini_heart_btn,cover_thread_retry,cover_img_validate,mode_btn_flat,cover_debug_log,mode_btn_align,cover_id_reuse,album_layer_fix,play_next_btn,album_api_fix,plus_icon,queue_panel,album_back_fix\n";
       }
     }
 
@@ -752,6 +753,11 @@ public:
       mCoverStop.store(false);
       mCoverWorker = std::thread([this] { coverLoop(); });
       __android_log_print(ANDROID_LOG_INFO, kTag, "步骤: 封面线程已启动");
+      // 收藏集合也独立成线程：fetchFavoriteHashes 是两次阻塞 httpGet
+      // （各 12 秒超时），放主循环里切列表就会卡住界面与音乐。
+      mFavIdsStop.store(false);
+      mFavIdsWorker = std::thread([this] { favIdsLoop(); });
+      __android_log_print(ANDROID_LOG_INFO, kTag, "步骤: 收藏集合线程已启动");
     } catch (const std::system_error &e) {
       mRunning.store(false);
       __android_log_print(ANDROID_LOG_ERROR, kTag, "线程创建失败: %s", e.what());
@@ -811,6 +817,11 @@ private:
     if (mCoverWorker.joinable()) {
       mCoverWorker.join();
     }
+    // 收藏集合线程也要在 mKugou 销毁前收掉。
+    mFavIdsStop.store(true);
+    if (mFavIdsWorker.joinable()) {
+      mFavIdsWorker.join();
+    }
   }
 
   void run() {
@@ -845,6 +856,11 @@ private:
         mSearchTarget = 2;
         mSearchPending = true;
       }
+      // 这里绝对不能再发「预取收藏」请求。
+      // 收藏请求的处理分支里有一条：若正停在推荐页红心子页，
+      // 会用收藏列表覆盖当前列表、并用 setQueueKeepCurrent 覆盖播放队列。
+      // 启动时 tab 默认就在推荐页红心，预取等于把列表和队列一起换掉，
+      // 与同时进行的「每日推荐」互相覆盖，表现就是歌单全乱。
       __android_log_print(ANDROID_LOG_INFO, kTag, "音源切换为酷狗概念版");
     } else {
       mEngine->setProvider(mProvider.get());
@@ -1111,6 +1127,16 @@ private:
             mKugou->loggedIn()) {
           if (mKugou->loadPlaylists()) {
             mUi.setFavoritePlaylists(mKugou->playlists());
+            // 顺手用已有缓存建一次收藏集合（只读内存，不发请求）。
+            if (!mRecCache[0].empty()) {
+              std::set<std::string> favIds;
+              for (const auto &t : mRecCache[0]) {
+                if (!t.id.empty()) {
+                  favIds.insert(t.id);
+                }
+              }
+              mUi.setFavoriteIds(favIds);
+            }
             __android_log_print(ANDROID_LOG_INFO, kTag, "收藏页歌单 %zu 个",
                                 mKugou->playlists().size());
           } else {
@@ -1160,13 +1186,91 @@ private:
           if (mKugou->loadAlbumSongs(openAlbum)) {
             const std::vector<musicmod::Track> songs = mKugou->tracks();
             mUi.setListTracks(songs);
-            mEngine->setQueue(songs);
+            // 这里绝对不能 setQueue：打开专辑只是「看」，不是「播」。
+            // 原来这一行会把正在播放的队列整个替换掉，
+            // 玩家只是想浏览专辑，结果当前正在放的歌被顶掉。
+            mUi.enterAlbumView();
             mUi.notify("已载入专辑 " + std::to_string(songs.size()) + " 首",
                        2600);
             __android_log_print(ANDROID_LOG_INFO, kTag, "专辑已载入 %zu 首",
                                 songs.size());
           } else {
             mUi.notify("专辑加载失败: " + mKugou->lastError(), 4000);
+          }
+        }
+        // ---- 收藏集合刷新：列表变了就请求一次（后台线程做，不阻塞）----
+        // 这样「搜索出来的歌是否已收藏」不依赖玩家先去过红心页。
+        {
+          const std::vector<musicmod::Track> &act = mUi.activeTracks();
+          const std::string head =
+              act.empty() ? std::string() : act.front().id;
+          if (!head.empty() && (head != mFavIdsLastHead ||
+                                act.size() != mFavIdsLastCount)) {
+            const long long nowMs = static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            if (mFavIdsLastSentMs == 0 || nowMs - mFavIdsLastSentMs > 1500) {
+              mFavIdsLastHead = head;
+              mFavIdsLastCount = act.size();
+              mFavIdsLastSentMs = nowMs;
+              mFavIdsRequest.store(1);
+            }
+          }
+        }
+        // ---- 播放队列侧栏：切换视图时拉一次最新队列 ----
+        if (mUi.takeQueueSyncRequest() != 0 && mEngine) {
+          const std::vector<musicmod::Track> &queue = mEngine->tracks();
+          mUi.setQueueTracks(queue);
+          __android_log_print(ANDROID_LOG_INFO, kTag, "队列同步: %zu 首",
+                              queue.size());
+        }
+        // ---- 下一首播放：把选中的歌插到当前曲目之后 ----
+        const int playNext = mUi.takePendingPlayNext();
+        if (playNext >= 0 && mEngine) {
+          // 队列视图下要取 mQueueTracks，否则会插错歌。
+          const std::vector<musicmod::Track> &shown = mUi.activeTracks();
+          if (static_cast<std::size_t>(playNext) < shown.size()) {
+            const musicmod::Track track = shown[playNext];
+            if (mEngine->insertNext(track)) {
+              // 这里绝对不能再把浏览列表换成播放队列。
+              // 原来调 setListTracks + showPlayQueue，点一次加号，
+              // 搜索页/推荐页的列表就被整个替换成播放队列，
+              // 玩家会以为「按钮坏了」，而且之后每次点击都在另一个列表上，
+              // 行号全错，看起来就是彻底失灵。
+              // 队列内容在「打开队列侧栏」时同步，界面保持原样。
+              const std::vector<musicmod::Track> &full = mEngine->tracks();
+              mUi.notify("已加入下一首播放", 1800);
+              __android_log_print(ANDROID_LOG_INFO, kTag,
+                                  "下一首播放: %s（队列 %zu 首）",
+                                  track.title.c_str(), full.size());
+            }
+          }
+        }
+        // ---- 行内收藏：点歌曲行右端的心形 ----
+        const int favRow = mUi.takePendingFavTrack();
+        if (favRow >= 0) {
+          if (mKugou == nullptr || !mKugou->loggedIn()) {
+            mUi.notify("请先登录", 2000);
+          } else {
+            const std::vector<musicmod::Track> &shown = mUi.activeTracks();
+            if (static_cast<std::size_t>(favRow) < shown.size()) {
+              const musicmod::Track track = shown[favRow];
+              const bool wasFav = mUi.isTrackFavorited(track.id);
+              const bool ok = wasFav ? mKugou->removeFromFavorites(track)
+                                     : mKugou->addToFavorites(track);
+              if (ok) {
+                mUi.setTrackFavoritedById(track.id, !wasFav);
+                mUi.notify(wasFav ? "已取消收藏" : "已收藏", 1600);
+                __android_log_print(ANDROID_LOG_INFO, kTag,
+                                    "行内收藏: %s -> %s", track.title.c_str(),
+                                    wasFav ? "取消" : "收藏");
+              } else {
+                mUi.notify("收藏失败: " + mKugou->lastError(), 3000);
+                __android_log_print(ANDROID_LOG_WARN, kTag, "行内收藏失败: %s",
+                                    mKugou->lastError().c_str());
+              }
+            }
           }
         }
         // 点了某个歌单：拉它的曲目，然后进第二层。
@@ -1183,11 +1287,25 @@ private:
             // 收藏目标固定由 is_def==1 决定，见 favoritesListId()。
             // 从歌单列表里找名字，交给 UI 显示在页头。
             std::string name = openId;
+            bool isDefaultList = false;
             for (const auto &pl : mKugou->playlists()) {
               if (pl.id == openId) {
                 name = pl.name;
+                isDefaultList = pl.isDefault;
                 break;
               }
+            }
+            // 「默认收藏」这一层的歌曲本身就是收藏内容：把 id 灌进集合，
+            // 行内心形才会显示实心。这条路径原来从不灌集合，
+            // 所以收藏页第二层整列都是空心，看起来像「收藏了却没收藏」。
+            if (isDefaultList) {
+              std::set<std::string> favIds;
+              for (const auto &t : songs) {
+                if (!t.id.empty()) {
+                  favIds.insert(t.id);
+                }
+              }
+              mUi.setFavoriteIds(favIds);
             }
             mUi.enterFavoritePlaylist(openId, name);
             __android_log_print(ANDROID_LOG_INFO, kTag,
@@ -1213,6 +1331,16 @@ private:
           // 的结果，直接赋值会让红心列表变成搜索列表。
           mFavoriteList = mKugou->tracks();
           mRecCache[0] = mFavoriteList;
+          // 行内心形靠这份集合判断实心/空心。
+          {
+            std::set<std::string> favIds;
+            for (const auto &t : mFavoriteList) {
+              if (!t.id.empty()) {
+                favIds.insert(t.id);
+              }
+            }
+            mUi.setFavoriteIds(favIds);
+          }
           if (mUi.currentTab() == 1 && mUi.currentRecTab() == 0) {
             const std::string keepId =
                 mEngine->currentTrack() != nullptr ? mEngine->currentTrack()->id
@@ -1244,6 +1372,8 @@ private:
                                 : musicmod::SearchKind::Artist;
           const bool kOk = mKugou->searchByKind(kind, keyword);
           if (kOk) {
+            // 新一轮搜索开始，之前的专辑层不再成立。
+            mUi.exitAlbumView();
             if (kind == musicmod::SearchKind::Album) {
               mUi.setSearchAlbums(mKugou->albums());
               __android_log_print(ANDROID_LOG_INFO, kTag,
@@ -1272,6 +1402,7 @@ private:
             daily ? mKugou->loadDailyRecommend(target - 2)
                   : mKugou->search(keyword);
         if (ok) {
+          mUi.exitAlbumView();
           auto list = mKugou->tracks();
           if (target == 0) {
             mSearchList = std::move(list);
@@ -1338,6 +1469,8 @@ private:
             mUi.notify("登录成功", 3000);
             mUi.setAccountState(true, mKugou->userId());
             mUi.closeLogin();
+            // 同样不要在这里预取收藏：登录后页面往往停在推荐页红心，
+            // 预取会把列表和播放队列一起换成收藏列表。
           } else {
             // 失败原因直接贴在登录页标题旁，不用等提示条消失。
             mUi.setSmsHint("登录失败: " + mKugou->lastError());
@@ -1845,6 +1978,34 @@ private:
   // 封面线程：只负责下载文件，不碰 UI。
   // 失败按 2s / 5s / 12s 退避，最多 3 次；成功即止。
   // 换歌时目标变了，计数清零重新开始。
+  void favIdsLoop() {
+    while (!mFavIdsStop.load()) {
+      if (mFavIdsRequest.exchange(0) == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        continue;
+      }
+      if (mKugou == nullptr || !mKugou->loggedIn()) {
+        continue;
+      }
+      std::set<std::string> ids;
+      bool ok = false;
+      {
+        // 与歌词、封面线程共用同一把网络锁，串行打服务库。
+        std::lock_guard<std::mutex> netLock(mNetMutex);
+        ok = mKugou->fetchFavoriteHashes(ids);
+      }
+      if (!ok || ids.empty()) {
+        // 失败保留旧集合：清空会让整列心形突然全变空心，更容易误导。
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+                            "收藏集合刷新失败，保留旧集合");
+        continue;
+      }
+      mUi.setFavoriteIds(ids);
+      __android_log_print(ANDROID_LOG_INFO, kTag, "收藏集合刷新: %zu 首",
+                          ids.size());
+    }
+  }
+
   void coverLoop() {
     std::string curId;
     int attempts = 0;
@@ -2063,6 +2224,16 @@ private:
   std::string mCoverDonePath;      // 完成后的本地文件
   // 歌词线程和封面线程都要打服务库，串行化避免并发写 KugouProvider。
   std::mutex mNetMutex;
+  // 收藏集合刷新线程：只拉「我喜欢」的 hash 集合，供界面判断心形状态。
+  // 绝不修改列表与播放队列——v62 那次把预取塞进列表流程，直接
+  // 把浏览列表和播放队列换成了收藏，玩家看到「歌单全乱」。
+  std::thread mFavIdsWorker;
+  std::atomic<bool> mFavIdsStop{false};
+  std::atomic<int> mFavIdsRequest{0};
+  // 触发节流：记住上次发请求时的列表特征。
+  std::string mFavIdsLastHead;
+  std::size_t mFavIdsLastCount{0};
+  long long mFavIdsLastSentMs{0};
   // 头像拉取全部在后台线程做。
   // 原因：httpGet 是阻塞 socket，超时 12 秒。v39 把它放在主循环里同步调用，
   // 一次失败就让主循环停摆十几秒——歌词行号不推进、世界检测失准、

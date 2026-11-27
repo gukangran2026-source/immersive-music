@@ -1,6 +1,7 @@
 #include "KugouProvider.hpp"
 #include <android/log.h>
 #include <cstdio>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -970,42 +971,14 @@ bool KugouProvider::loadFavorites() {
   const std::string cookieText =
       "token=" + mToken + "; userid=" + mUserId;
   const std::string cookieArg = "&cookie=" + urlEncode(cookieText);
-  // 先列云歌单，再取曲目最多的那个当作「我喜欢」。
-  // 旧实现写死 listid=8，账号里根本没有这个歌单，接口直接回 30203。
-  const HttpResult listRes =
-      httpGet(mPort, "/user/playlist?page=1&pagesize=100" + cookieArg, 12000);
-  std::string listId;
-  int bestCount = -1;
-  if (listRes.ok && !listRes.body.empty()) {
-    try {
-      const auto root = nlohmann::json::parse(listRes.body);
-      const auto &data = root["data"];
-      if (data.is_object() && data.contains("info") &&
-          data["info"].is_array()) {
-        for (const auto &item : data["info"]) {
-          const std::string id = jsonString(item, "list_create_listid");
-          if (id.empty()) {
-            continue;
-          }
-          int count = 0;
-          if (item.contains("m_count") && item["m_count"].is_number()) {
-            count = item["m_count"].get<int>();
-          }
-          if (count > bestCount) {
-            bestCount = count;
-            listId = id;
-          }
-        }
-      }
-    } catch (const std::exception &) {
-    }
-  }
+  // 「我喜欢」统一走 favoritesListId()：它优先取 is_def==1 的歌单，
+  // 与 addToFavorites / removeFromFavorites 的写入目标是同一张。
+  // 旧实现这里另按「曲目最多」挑，读的写的不是同一张歌单，
+  // 表现就是「收藏了却显示没收藏」或反过来。
+  const std::string listId = favoritesListId();
   if (listId.empty()) {
-    listId = "2";
-  }
-  if (bestCount == 0) {
-    mLastError = "账号里还没有收藏歌曲";
-    __android_log_print(ANDROID_LOG_WARN, kTag, "红心歌单为空");
+    mLastError = "找不到收藏歌单";
+    __android_log_print(ANDROID_LOG_WARN, kTag, "找不到收藏歌单");
     return false;
   }
   const std::string path =
@@ -1190,6 +1163,64 @@ bool KugouProvider::fetchCover(const Track &track, const std::string &path) {
   __android_log_print(ANDROID_LOG_INFO, kTag, "封面已下载 %zu 字节 %s",
                       image.body.size(), cover.c_str());
   return true;
+}
+
+bool KugouProvider::fetchFavoriteHashes(std::set<std::string> &out) {
+  out.clear();
+  if (mPort <= 0 || mToken.empty()) {
+    return false;
+  }
+  const std::string cookieText = "token=" + mToken + "; userid=" + mUserId;
+  const std::string cookieArg = "&cookie=" + urlEncode(cookieText);
+  // 歌单 id 必须与「写入收藏」同源：favoritesListId() 优先取 is_def==1
+  // 的「默认收藏」。旧实现这里按「曲目最多」另挑一张，读写不一致，
+  // 会出现「明明收藏了却显示没收藏」。
+  const std::string listId = favoritesListId();
+  if (listId.empty()) {
+    return false;
+  }
+  // 分页拉全。pagesize 用 MD3 的默认值 30，给太大服务端会截断或拒绝。
+  constexpr int kPageSize = 30;
+  bool anyPageOk = false;
+  for (int page = 1; page <= 6; ++page) {
+    const std::string path = "/playlist/track/all/new?listid=" +
+                             urlEncode(listId) + "&page=" +
+                             std::to_string(page) + "&pagesize=" +
+                             std::to_string(kPageSize) + cookieArg;
+    const HttpResult result = httpGet(mPort, path, 12000);
+    if (!result.ok || result.body.empty()) {
+      break;
+    }
+    std::size_t got = 0;
+    try {
+      const auto root = nlohmann::json::parse(result.body);
+      const auto &data = root["data"];
+      if (!data.is_object() || !data.contains("info") ||
+          !data["info"].is_array()) {
+        break;
+      }
+      for (const auto &item : data["info"]) {
+        std::string hash = jsonString(item, "hash");
+        if (hash.empty()) {
+          continue;
+        }
+        // 统一小写：搜索结果用的是 FileHash，收藏接口用的是 hash，
+        // 两者大小写不一定一致，不归一就会「收藏了却显示没收藏」。
+        for (auto &ch : hash) {
+          ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        out.insert(hash);
+        ++got;
+      }
+    } catch (const std::exception &) {
+      break;
+    }
+    anyPageOk = true;
+    if (got < static_cast<std::size_t>(kPageSize)) {
+      break;  // 最后一页
+    }
+  }
+  return anyPageOk && !out.empty();
 }
 
 bool KugouProvider::loadDailyRecommend(int variant) {
@@ -2475,8 +2506,14 @@ bool KugouProvider::loadAlbumSongs(const std::string &albumId) {
   if (mPort <= 0 || albumId.empty()) {
     return false;
   }
-  const std::string path =
-      "/album/songs?album_id=" + urlEncode(albumId) + "&page=1&pagesize=200";
+  // 与 MD3 的实现对齐：必须带 cookie，pagesize 用 30。
+  // 原来给的是 pagesize=200 且没带 cookie —— 服务端直接拒绝，
+  // 界面上就是「专辑加载失败: 专辑歌曲请求失败」。
+  // 歌单接口给 500 时回 502，同一个坑，值不能贪大。专辑通常十几首，30 够。
+  const std::string cookieArg =
+      "&cookie=" + urlEncode("token=" + mToken + "; userid=" + mUserId);
+  const std::string path = "/album/songs?album_id=" + urlEncode(albumId) +
+                           "&page=1&pagesize=30" + cookieArg;
   const HttpResult result = httpGet(mPort, path, 15000);
   if (!result.ok || result.body.empty()) {
     mLastError = "专辑歌曲请求失败";

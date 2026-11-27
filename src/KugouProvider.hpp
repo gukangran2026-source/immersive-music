@@ -1,5 +1,6 @@
 #pragma once
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,10 @@ public:
   bool loadAlbumSongs(const std::string &albumId);
   // 加载「我喜欢」歌单，替换内部曲目列表。
   bool loadFavorites();
+  // 只取「我喜欢」里所有歌曲的 hash（统一转小写），
+  // 不修改任何内部缓存，可在后台线程安全调用。
+  // 行内心形靠它判断「这首歌是否已收藏」。
+  bool fetchFavoriteHashes(std::set<std::string> &out);
   // 每日自动推荐：variant=0 探索，variant=1 小众。
   bool loadDailyRecommend(int variant);
   // 按一首歌继续生成相似推荐，用于歌单播完后的自动续接。

@@ -2,7 +2,7 @@
   "type": "preload-native",
   "name": "沉浸播放",
   "author": "gukangran2026-source",
-  "version": "0.45",
+  "version": "0.57",
   "entry": "libmusicmod.so",
   "minecraft_versions": [
     "1.26.62.*",

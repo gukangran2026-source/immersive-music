@@ -62,6 +62,40 @@ public:
   int takeArtistLoadRequest() { return mArtistLoadRequest.exchange(0); }
   // 取出一次「打开专辑」请求。
   std::string takeOpenAlbumRequest();
+  // main 成功拉到专辑歌曲后调用，把界面切到「专辑歌曲」这一层。
+  // 只有成功才切：失败了停在原列表，不会出现空白层。
+  void enterAlbumView();
+  // 从专辑歌曲返回上一层（歌手页专辑列表 或 搜索专辑列表）。
+  void exitAlbumView();
+  // 取走「下一首播放」请求的行号；-1 表示没有请求。
+  int takePendingPlayNext();
+  // 行内收藏：取走一次请求的行号；-1 表示没有请求。
+  int takePendingFavTrack() { return mPendingFavTrack.exchange(-1); }
+  // main 拉完「我的收藏」后把歌曲 id 集合灌进来，绘制侧据此画实心/空心。
+  void setFavoriteIds(const std::set<std::string> &ids);
+  // 单条收藏状态变更：main 收藏/取消成功之后回填。
+  void setTrackFavoritedById(const std::string &id, bool favorited);
+  // 某首歌是否已收藏（带锁，供 main 判断该加还是该删）。
+  bool isTrackFavorited(const std::string &id);
+  // 绘制用：某一行是否已收藏。调用方已持界面锁，这里不再加锁。
+  bool rowFavoritedLocked(std::size_t index) const;
+  // 播放队列侧栏：0=关 1=开。点大面板的三条杠按钮切换。
+  void toggleQueueView();
+  bool queueView() const { return mQueueView == 1; }
+  // main 把引擎队列同步进来（切换视图时拉一次）。
+  void setQueueTracks(const std::vector<Track> &tracks);
+  // 取走同步请求；非 0 表示 main 需要调一次 setQueueTracks。
+  int takeQueueSyncRequest();
+  // 当前列表对应的曲目数据。队列视图下是队列，否则是浏览列表。
+  // main 取「下一首播放」的目标时要用它，否则会取错列表。
+  const std::vector<Track> &activeTracks() const {
+    return (mQueueView == 1) ? mQueueTracks : mShownTracks;
+  }
+
+  // 把视图归位成「正在看歌曲列表」。
+  // 插队后列表会同步成播放队列，此时必须确保绘制分支也走歌曲行，
+  // 否则会出现「页头写着专辑、画的却是专辑卡片、数据却是歌曲」的错乱。
+  void showPlayQueue();
   // 待加载的歌手 id（不消费，只读）。
   const std::string &pendingArtistId() const { return mPendingArtistId; }
   // 是否还需要拉歌手资料：名字为空或头像为空时算需要。
@@ -295,7 +329,30 @@ private:
  public:
   // 列表区上沿。绘制与触摸必须共用这一个函数，否则必然错位。
   // 历史坑：歌手页绘制用 y+104、触摸用 y+140，差 36px，表现为「点哪都不对」。
+  // 面板矩形（含 16 像素容差）。触摸命中判断统一用它：
+  // 面板之外一律不消费事件，把触摸还给游戏。
+  // 历史坑：handleTouchLocked 末尾无条件 return true，按下时又无条件
+  // 置 mTracking = true，导致面板外的按下和随后的移动都被吞掉，
+  // 玩家反馈的「听歌中途摇杆失灵、视角转不动」就是这个。
+  bool inPanelArea(float x, float y) const {
+    constexpr float kPad = 16.0f;
+    return x >= mTargetX - kPad && x <= mTargetX + mTargetW + kPad &&
+           y >= mTargetY - kPad && y <= mTargetY + mTargetH + kPad;
+  }
+  // 列表区高度。绘制与触摸必须共用这一个函数，否则滚动行数会算错。
+  // 队列视图没有底部 tab 栏，列表可以一直铺到面板下沿。
+  float listHeightFor() const {
+    if (mQueueView == 1) {
+      return mTargetH - 56.0f - 12.0f;
+    }
+    return mTargetH - 168.0f;
+  }
   float listTopFor() const {
+    if (mQueueView == 1) {
+      // 队列侧栏独占左半边：没有搜索框、没有分类标签，
+      // 列表直接顶到标题下方。绘制与触摸共用这里，不会错位。
+      return mTargetY + 56.0f;
+    }
     if (mArtistView == 1) {
       // 歌手页：返回键 y+70~98，子标签 y+100~130，列表从 y+140 起。
       return mTargetY + 140.0f;
@@ -483,6 +540,10 @@ private:
   float mMineLogoutY{0.0f};
   float mMineVipY{0.0f};
   float mMineUploadY{0.0f};
+  // 「关闭中面板」开关：开启后跳过中面板，单行条直接展开成大面板。
+  bool mDisableMini{false};
+  // 该开关在「我的」页的纵向位置，由绘制侧写入、触摸侧读取。
+  float mMineDisableMiniY{0.0f};
   float mDownX{0.0f};
   float mDownY{0.0f};
   float mPressRectX{0.0f};
@@ -606,6 +667,30 @@ private:
   std::atomic<int> mArtistLoadRequest{0};
   // 待打开的专辑 id（从歌手页点专辑进去）。
   std::string mPendingAlbumId;
+  // 专辑歌曲页：0=不在这一层 1=正在看某张专辑的歌曲。
+  // 有了这一层，点专辑后才能把「专辑卡片列表」让开，
+  // 否则卡片和歌曲会同时画出来（穿模），点击也会被卡片分支吃掉。
+  int mAlbumView{0};
+  // 当前打开的专辑名，用于页头显示。
+  std::string mAlbumOpenName;
+  // 点击时记下的专辑名，main 加载成功后由 enterAlbumView 采用。
+  std::string mPendingAlbumName;
+  // 「下一首播放」请求的行号，-1 表示无。
+  std::atomic<int> mPendingPlayNext{-1};
+  // 行内收藏请求的行号。
+  std::atomic<int> mPendingFavTrack{-1};
+  // 已收藏歌曲的 id 集合。来自「我的收藏」列表，供行内心形显示实心/空心。
+  std::set<std::string> mFavTrackIds;
+  // 触摸路径已持锁，用这个不加锁的版本，避免死锁。
+  void toggleQueueViewLocked();
+  // 播放队列侧栏状态与数据。
+  int mQueueView{0};
+  std::vector<Track> mQueueTracks;
+  std::atomic<int> mQueueSyncRequest{0};
+  // 当前列表显示的确实是「歌曲行」吗。
+  // 专辑卡片、歌手卡片、歌单卡片都返回 false —— 它们不该有
+  // 「下一首播放」这个键，也不该按歌曲行的方式处理点击。
+  bool listShowsTracksLocked() const;
   // 切句时间戳：供歌词滚动做补间，避免切句瞬间跳一行。
   long long mLyricSwitchMs{0};
   // 面板透明度，0.0–1.0；可在「我的」页调节，写入 ui.json。

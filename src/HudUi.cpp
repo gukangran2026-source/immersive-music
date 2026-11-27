@@ -10,6 +10,7 @@
 #include <chrono>
 #include <ctime>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
@@ -946,6 +947,16 @@ void glyphModeRepeatOne(Out &out, float cx, float cy, float s,
 }
 
 // 爱心：两个圆 + 一个倒三角，标准画法，缩到 18px 仍然认得出。
+// hash 统一小写：搜索结果取 FileHash，收藏接口取 hash，
+// 两者值可能只差大小写。不归一就会出现「收藏了却没显示收藏」。
+std::string lowerHash(const std::string &in) {
+  std::string out = in;
+  for (auto &ch : out) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  return out;
+}
+
 void glyphHeart(Out &out, float cx, float cy, float s, bool filled,
                 std::uint32_t color) {
   const float r = s * 0.27f;
@@ -2311,6 +2322,11 @@ void HudUi::setListTracks(const std::vector<Track> &tracks) {
   }
   mTrackCount = tracks.size();
   mManualList = true;
+  // 诊断：把列表首曲 id 打出来，与「收藏集合样本」对比即可判断
+  // 心形显示不准是「id 不匹配」还是「集合不对」。
+  __android_log_print(ANDROID_LOG_INFO, kTag, "列表更新: %zu 首 首曲id=%s",
+                      mTrackIds.size(),
+                      mTrackIds.empty() ? "-" : mTrackIds.front().c_str());
   // 数据真的变了就重放滑入动画。
   // 原来动画只在点击时触发，但子分类数据是异步拉取的：
   // 第一次点「探索」时缓存为空，列表瞬间清空，动画在空列表上播，看不见。
@@ -2409,9 +2425,146 @@ void HudUi::enterArtist(const ArtistInfo &artist) {
 
 // 已持锁版本：只做状态变更，不再加锁。
 // 触摸路径（handleTouchLocked）必须调这个，否则同一线程二次加锁会死锁。
+void HudUi::enterAlbumView() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mAlbumView = 1;
+  mAlbumOpenName = mPendingAlbumName;
+  mListScroll = 0.0f;
+  // 这一层没有输入框，别让键盘继续往看不见的地方打字。
+  mInputActive = false;
+  mDirty = true;
+}
+
+void HudUi::exitAlbumView() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mAlbumView = 0;
+  mAlbumOpenName.clear();
+  mListScroll = 0.0f;
+  mDirty = true;
+}
+
+int HudUi::takePendingPlayNext() { return mPendingPlayNext.exchange(-1); }
+
+void HudUi::setFavoriteIds(const std::set<std::string> &ids) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mFavTrackIds.clear();
+  for (const auto &raw : ids) {
+    if (raw.empty()) {
+      continue;
+    }
+    mFavTrackIds.insert(lowerHash(raw));
+  }
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "收藏集合已更新: %zu 首 样本=%s",
+                      mFavTrackIds.size(),
+                      mFavTrackIds.empty() ? "-" : mFavTrackIds.begin()->c_str());
+}
+
+void HudUi::setTrackFavoritedById(const std::string &id, bool favorited) {
+  if (id.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mMutex);
+  const std::string key = lowerHash(id);
+  if (favorited) {
+    mFavTrackIds.insert(key);
+  } else {
+    mFavTrackIds.erase(key);
+  }
+  mDirty = true;
+}
+
+bool HudUi::isTrackFavorited(const std::string &id) {
+  if (id.empty()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mMutex);
+  return mFavTrackIds.count(lowerHash(id)) > 0;
+}
+
+bool HudUi::rowFavoritedLocked(std::size_t index) const {
+  // 调用方已持界面锁。队列视图查队列，其余查浏览列表。
+  std::string id;
+  if (mQueueView == 1) {
+    if (index < mQueueTracks.size()) {
+      id = mQueueTracks[index].id;
+    }
+  } else if (index < mTrackIds.size()) {
+    id = mTrackIds[index];
+  }
+  return !id.empty() && mFavTrackIds.count(lowerHash(id)) > 0;
+}
+
+void HudUi::toggleQueueView() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mQueueView = (mQueueView == 1) ? 0 : 1;
+  // 切换时要拿一次最新的引擎队列。
+  mQueueSyncRequest.store(1);
+  mListScroll = 0.0f;
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "播放队列侧栏: %s",
+                      mQueueView == 1 ? "打开" : "关闭");
+}
+
+void HudUi::toggleQueueViewLocked() {
+  mQueueView = (mQueueView == 1) ? 0 : 1;
+  mQueueSyncRequest.store(1);
+  mListScroll = 0.0f;
+  mDirty = true;
+  __android_log_print(ANDROID_LOG_INFO, kTag, "播放队列侧栏: %s",
+                      mQueueView == 1 ? "打开" : "关闭");
+}
+
+void HudUi::setQueueTracks(const std::vector<Track> &tracks) {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mQueueTracks = tracks;
+  mDirty = true;
+}
+
+int HudUi::takeQueueSyncRequest() { return mQueueSyncRequest.exchange(0); }
+
+void HudUi::showPlayQueue() {
+  std::lock_guard<std::mutex> lock(mMutex);
+  mAlbumView = 0;
+  mAlbumOpenName.clear();
+  // 退出歌手页与搜索的卡片分类，统一回到「歌曲行」。
+  mArtistView = 0;
+  mArtistAlbums.clear();
+  mSearchKind = 0;
+  mListScroll = 0.0f;
+  mDirty = true;
+}
+
+bool HudUi::listShowsTracksLocked() const {
+  if (mQueueView == 1) {
+    // 队列视图在「我的」页也要显示播放列表：那页的设置项此时整体让路，
+    // 左半边只剩队列。原来这里 return false，导致在我的页开队列是空白。
+    return true;
+  }
+  if (mTab == Tab::Mine) {
+    return false;  // 「我的」页是设置项，没有歌曲列表
+  }
+  if (mTab == Tab::Favorites && mFavView == 0) {
+    return false;  // 收藏页第一层是歌单卡片
+  }
+  if (mTab == Tab::Search && mAlbumView == 1) {
+    return true;  // 专辑歌曲层
+  }
+  if (mArtistView == 1 && mArtistTab == 1) {
+    return false;  // 歌手页的专辑子标签
+  }
+  if (mTab == Tab::Search && mArtistView == 0 && mSearchKind != 0) {
+    return false;  // 搜索页的专辑/歌手分类
+  }
+  return true;
+}
+
 void HudUi::exitArtistLocked() {
   mArtistView = 0;
   mArtistAlbums.clear();
+  // 退出歌手页时必须一并退出专辑层，否则下次进来还停在上次的专辑里。
+  mAlbumView = 0;
+  mAlbumOpenName.clear();
   mListScroll = 0.0f;
   mDirty = true;
 }
@@ -2617,6 +2770,8 @@ void HudUi::loadState() {
         mAlphaMini = std::stof(value);
       } else if (key == "alphaBar") {
         mAlphaBar = std::stof(value);
+      } else if (key == "disableMini") {
+        mDisableMini = (value == "1");
       } else if (key == "uploadListen") {
         mUploadListen.store(value == "1");
       } else if (key == "prefLevel") {
@@ -2669,6 +2824,7 @@ void HudUi::saveState() {
     output << "hasBall=" << (mHasBallPos ? 1 : 0) << "\n";
     output << "mode=" << static_cast<int>(mMode) << "\n";
     output << "uploadListen=" << (mUploadListen.load() ? 1 : 0) << "\n";
+    output << "disableMini=" << (mDisableMini ? 1 : 0) << "\n";
     output << "panelAlpha=" << mPanelAlpha << "\n";
     output << "alphaMini=" << mAlphaMini << "\n";
     output << "alphaBar=" << mAlphaBar << "\n";
@@ -2954,6 +3110,16 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
                         mLoginPage ? 1 : 0, mSmsMode ? 1 : 0);
     // 动画期间命中区域与画面不一致，这一帧不处理，但要消费掉，
     // 否则事件链会被游戏接走，抬指再也回不来。
+    // 面板矩形之外：不消费，直接把事件还给游戏。
+    // 原来这里一路走到底 return true，并且下面会无条件置 mTracking = true，
+    // 面板外的按下被吞之后，后续的移动也一并被吞——游戏中表现就是
+    // 移动摇杆没反应、划屏不转视角。「只触发过一次」是因为它取决于
+    // 手指有没有正好落在面板边缘的 16 像素容差内。
+    if (!inPanelArea(x, y)) {
+      return false;
+    }
+    // 动画期间命中区域与画面不一致，这一帧不处理。
+    // 已确认落在面板内，必须消费掉，否则事件链会被游戏接走。
     if (mAnimating) {
       return true;
     }
@@ -3122,7 +3288,7 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
     // 我的：推荐偏好与退出登录。
     // 注意：这里不能加 mLoggedIn 前置条件。绘制侧（我的页）不要求登录，
     // 若点击侧要求，未登录时控件看得见却点不动，透明度与主题都调不了。
-    if (mTab == Tab::Mine) {
+    if (mTab == Tab::Mine && mQueueView == 0) {
       // 三形态独立的透明度：改成滑块，按下即定位、可连续拖动。
       // 坐标全部来自绘制侧写入的 mAlphaRowY / mAlphaSliderX/W，
       // 不再两边各写一套硬编码（历史上因此多次「看得见点不到」）。
@@ -3185,6 +3351,25 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
         deferred = [this] { saveState(); };
         mPressRectX = mTargetX + 24.0f;
         mPressRectY = mMineUploadY;
+        mPressRectW = 300.0f;
+        mPressRectH = 48.0f;
+        mPressedUntil = nowMs() + 140;
+        mDirty = true;
+        return true;
+      }
+      if (mMineDisableMiniY > 0.0f &&
+          insideButton(x, y, mTargetX + 24.0f, mMineDisableMiniY, 300.0f,
+                       48.0f, 4.0f, 8.0f)) {
+        mDisableMini = !mDisableMini;
+        // 开启时若正停在中面板，直接退到单行条，否则这一档再也进不去。
+        if (mDisableMini && mMode == Mode::Mini) {
+          mMode = Mode::Bar;
+          placePanel();
+        }
+        setNoticeLocked(mDisableMini ? "已关闭中面板" : "已恢复中面板", 2000);
+        deferred = [this] { saveState(); };
+        mPressRectX = mTargetX + 24.0f;
+        mPressRectY = mMineDisableMiniY;
         mPressRectW = 300.0f;
         mPressRectH = 48.0f;
         mPressedUntil = nowMs() + 140;
@@ -3262,7 +3447,8 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
         mDirty = true;
         mMoved = true;   // 吞掉后面的抬手，避免在新形态上误点
         // 三层阶梯：单行条 -> 中面板 -> 大面板。
-        mMode = Mode::Mini;
+        // 玩家在「我的」里关掉中面板时，直接从单行条跳到大面板。
+        mMode = mDisableMini ? Mode::Expanded : Mode::Mini;
         placePanel();
         return true;
       }
@@ -3443,7 +3629,7 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
     // 竖向，从下往上增长，所以比例是 (底 - y) / 高度。
     // 「我的」页不绘制音量条，这里也必须排除，
     // 否则会出现「看不见但右下角能拖」。
-    if (mTab != Tab::Mine && mVolBarH > 0.0f &&
+    if (mTab != Tab::Mine && mQueueView == 0 && mVolBarH > 0.0f &&
         insideRect(x, y, mVolBarX, mVolBarY, mVolBarW, mVolBarH)) {
       mDrag = Drag::Volume;
       const float top = mVolBarY + 8.0f;
@@ -3479,7 +3665,7 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
       mPositionMs = mDragSeekMs;
       mDirty = true;
     } else if (mMode == Mode::Expanded) {
-      const float listH = mTargetH - 168.0f;
+      const float listH = listHeightFor();
       const float trackX = mTargetX + 24.0f + 540.0f - 10.0f;
       const int visible = std::max(1, static_cast<int>(listH / 54.0f));
       const int maxScroll = std::max(0, static_cast<int>(mTrackCount) - visible);
@@ -3557,7 +3743,7 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
       // 这里原来写死 54，字号 >1.35 时两者不同，滚动位移与实际
       // 行位置对不上，表现就是「滑一下卡一下」。
       const float kRowH = std::max(54.0f, 40.0f * mFontScale);
-      const float listH = mTargetH - 168.0f;
+      const float listH = listHeightFor();
       const int maxRows = static_cast<int>(listH / kRowH);
       float maxScroll = static_cast<float>(mTrackCount) -
                         static_cast<float>(maxRows);
@@ -3577,7 +3763,7 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
     }
 
     if (mDrag == Drag::ScrollThumb) {
-      const float listH = mTargetH - 168.0f;
+      const float listH = listHeightFor();
       const int visible = std::max(1, static_cast<int>(listH / 54.0f));
       const int total = std::max(1, static_cast<int>(mTrackCount));
       const float maxScroll =
@@ -3848,6 +4034,12 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
       mDirty = true;
       return true;
     }
+    // 三条杠：播放队列侧栏（infoX + 390）。
+    if (insideButton(x, y, baseX + 366.0f, btnY2 - 28.0f, 48.0f, 56.0f, 2.0f,
+                     4.0f)) {
+      toggleQueueViewLocked();
+      return true;
+    }
     // 收藏键：infoX + 310（播放方式右边一格）。
     if (insideButton(x, y, baseX + 288.0f, btnY2 - 22.0f, 44.0f, 44.0f, 2.0f,
                      4.0f)) {
@@ -3857,10 +4049,10 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
     }
   }
 
-// 右上角叉号：收回中面板
+  // 右上角叉号：收回中面板；关掉中面板时直接回单行条。
   if (insideButton(x, y, mTargetX + mTargetW - 64.0f, mTargetY + 12.0f, 48.0f,
                  52.0f, 8.0f, 10.0f)) {
-    mMode = Mode::Mini;
+    mMode = mDisableMini ? Mode::Bar : Mode::Mini;
     placePanel();
     return true;
   }
@@ -3876,7 +4068,21 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
   // 输入框与确定键
   const float inputY = mTargetY + 52.0f;
   const float listLeft = mTargetX + 24.0f;
-  if (mTab == Tab::Search &&
+  // 专辑层的返回键必须放在输入框之前判断。
+  // 两者位置几乎完全重叠（都是 x+24 起、y+52 起，高度 36 / 40），
+  // 输入框在前时永远先命中 —— 表现就是「点返回弹出键盘、返回没反应」。
+  if (mTab == Tab::Search && mAlbumView == 1 && mQueueView == 0 &&
+      insideButton(x, y, listLeft, inputY, 96.0f, 36.0f, 2.0f, 6.0f)) {
+    __android_log_print(ANDROID_LOG_INFO, kTag, "专辑页: 返回");
+    mAlbumView = 0;
+    mAlbumOpenName.clear();
+    mListScroll = 0.0f;
+    // 退出这一层必须同时收起输入态，否则键盘还挂在屏幕上。
+    mInputActive = false;
+    mDirty = true;
+    return true;
+  }
+  if (mTab == Tab::Search && mAlbumView == 0 && mQueueView == 0 &&
       insideButton(x, y, listLeft, inputY, 540.0f - 74.0f, 40.0f, 4.0f, 12.0f)) {
     __android_log_print(ANDROID_LOG_INFO, kTag,
                         "点击输入框: 键盘回调=%d 文本回调=%d",
@@ -3891,7 +4097,7 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
     setNoticeLocked("输入完成后点确定", 2500);
     return true;
   }
-  if (mTab == Tab::Search &&
+  if (mTab == Tab::Search && mQueueView == 0 &&
       insideButton(x, y, listLeft + 540.0f - 66.0f, inputY, 66.0f, 40.0f, 4.0f, 12.0f)) {
     mPendingSearchText = mInputText;
     mSearchSubmit.store(1);
@@ -3901,7 +4107,8 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
   // 底部四个一级入口：搜索、推荐、收藏、我的。
   const float tabY = mTargetY + mTargetH - 54.0f;
   const float tabW = 540.0f / 4.0f;
-  if (insideButton(x, y, listLeft, tabY, 540.0f, 40.0f, 0.0f, 12.0f)) {
+  if (mQueueView == 0 &&
+      insideButton(x, y, listLeft, tabY, 540.0f, 40.0f, 0.0f, 12.0f)) {
     const int slot = static_cast<int>((x - listLeft) / tabW);
     // 显示位次 -> Tab 枚举值，必须与绘制侧 tabEnums 一致。
     const int slotToTab[4] = {static_cast<int>(Tab::Search),
@@ -3944,7 +4151,7 @@ bool HudUi::handleTouchLocked(int action, float x, float y, long long timeMs,
     return true;
   }
   // 推荐页顶部的三个子分类。
-  if (mTab == Tab::Recommend) {
+  if (mTab == Tab::Recommend && mQueueView == 0) {
     const float subY = mTargetY + 52.0f;
     const float subW = 540.0f / 3.0f;
     for (int i = 0; i < 3; ++i) {
@@ -3985,8 +4192,12 @@ const float listX = mTargetX + 24.0f;
   const float listW = 540.0f;
   // 必须与绘制侧的行高公式完全一致，否则点击会错行。
   const float rowH = std::max(54.0f, 40.0f * mFontScale);
+  // 专辑层的返回键已经在「输入框」之前处理掉了（见上方说明），
+  // 这里不再重复判断，避免两处坐标各自演化后再次错位。
+
   // ============ 歌手页（优先于搜索页与列表行）============
-  if (mArtistView == 1) {
+  if (mTab == Tab::Search && mArtistView == 1 && mAlbumView == 0 &&
+      mQueueView == 0) {
     // 返回键：与绘制侧同坐标（listLeft, mTargetY+70, 96x28）。
     if (insideButton(x, y, listLeft, mTargetY + 70.0f, 96.0f, 28.0f, 2.0f,
                      6.0f)) {
@@ -4038,8 +4249,22 @@ const float listX = mTargetX + 24.0f;
         if (idx3 >= 0 &&
             static_cast<std::size_t>(idx3) < mArtistAlbums.size()) {
           mPendingAlbumId = mArtistAlbums[idx3].id;
+          mPendingAlbumName = mArtistAlbums[idx3].name;
           __android_log_print(ANDROID_LOG_INFO, kTag, "歌手页: 打开专辑 %s",
                               mArtistAlbums[idx3].name.c_str());
+        }
+        return true;
+      }
+      // 歌手页单曲行同样支持「下一首播放」。
+      if (x >= listX + listW - 56.0f && x <= listX + listW - 6.0f) {
+        if (idx3 >= 0 &&
+            static_cast<std::size_t>(idx3) < mTrackIds.size()) {
+          mPendingPlayNext.store(idx3);
+          setNoticeLocked("已加入下一首播放", 1600);
+          mDirty = true;
+          __android_log_print(ANDROID_LOG_INFO, kTag,
+                              "下一首播放(歌手页): 行 %d 列表=%zu", idx3,
+                              mTrackCount);
         }
         return true;
       }
@@ -4054,7 +4279,8 @@ const float listX = mTargetX + 24.0f;
 
   // ============ 搜索页三分类标签 ============
   // 与绘制侧同条件：没有查询词时不响应，避免点到看不见的东西。
-  if (mTab == Tab::Search && mArtistView == 0 && searchHasQuery()) {
+  if (mTab == Tab::Search && mArtistView == 0 && mAlbumView == 0 &&
+      mQueueView == 0 && searchHasQuery()) {
     for (int ki = 0; ki < 3; ++ki) {
       if (insideButton(x, y, listLeft + ki * 180.0f, mTargetY + 96.0f, 180.0f,
                        30.0f, 1.0f, 4.0f)) {
@@ -4076,7 +4302,7 @@ const float listX = mTargetX + 24.0f;
 
   // ============ 收藏页 ============
   // 第二层的返回键：放左半边，坐标必须与绘制侧完全一致。
-  if (mTab == Tab::Favorites && mFavView == 1 &&
+  if (mTab == Tab::Favorites && mFavView == 1 && mQueueView == 0 &&
       insideButton(x, y, listLeft, mTargetY + 70.0f, 96.0f, 28.0f, 2.0f,
                    6.0f)) {
     __android_log_print(ANDROID_LOG_INFO, kTag, "收藏页: 返回歌单列表");
@@ -4087,9 +4313,9 @@ const float listX = mTargetX + 24.0f;
     return true;
   }
   // 第一层：点歌单卡片进入。
-  if (mTab == Tab::Favorites && mFavView == 0 &&
-      insideRect(x, y, listX, listY, listW, mTargetH - 168.0f)) {
-    const float listH2 = mTargetH - 168.0f;
+  if (mTab == Tab::Favorites && mFavView == 0 && mQueueView == 0 &&
+      insideRect(x, y, listX, listY, listW, listHeightFor())) {
+    const float listH2 = listHeightFor();
     const int startRow2 = std::max(0, static_cast<int>(mListScroll));
     const float rowShift2 =
         (mListScroll - static_cast<float>(startRow2)) * rowH;
@@ -4116,8 +4342,11 @@ const float listX = mTargetX + 24.0f;
   }
 
   // 搜索页「专辑」分类：点卡片进入专辑歌曲。
-  if (mTab == Tab::Search && mSearchKind == 1 &&
-      insideRect(x, y, listX, listY, listW, mTargetH - 168.0f)) {
+  // 必须排除专辑层与歌手页：否则进了专辑歌曲再点行，
+  // 会被这里当成「又点了一次专辑卡片」，行数据被当专辑处理（穿模的根源）。
+  if (mTab == Tab::Search && mArtistView == 0 && mAlbumView == 0 &&
+      mQueueView == 0 && mSearchKind == 1 &&
+      insideRect(x, y, listX, listY, listW, listHeightFor())) {
     const float shiftA = (mListScroll -
                           static_cast<float>(std::max(0, static_cast<int>(mListScroll)))) *
                          rowH;
@@ -4125,14 +4354,16 @@ const float listX = mTargetX + 24.0f;
     const int idxA = std::max(0, static_cast<int>(mListScroll)) + rowA;
     if (idxA >= 0 && static_cast<std::size_t>(idxA) < mSearchAlbums.size()) {
       mPendingAlbumId = mSearchAlbums[idxA].id;
+      mPendingAlbumName = mSearchAlbums[idxA].name;
       __android_log_print(ANDROID_LOG_INFO, kTag, "搜索页: 打开专辑 %s",
                           mSearchAlbums[idxA].name.c_str());
     }
     return true;
   }
   // 搜索页「歌手」分类：点卡片进歌手页。
-  if (mTab == Tab::Search && mSearchKind == 2 &&
-      insideRect(x, y, listX, listY, listW, mTargetH - 168.0f)) {
+  if (mTab == Tab::Search && mArtistView == 0 && mAlbumView == 0 &&
+      mQueueView == 0 && mSearchKind == 2 &&
+      insideRect(x, y, listX, listY, listW, listHeightFor())) {
     const float shiftB = (mListScroll -
                           static_cast<float>(std::max(0, static_cast<int>(mListScroll)))) *
                          rowH;
@@ -4153,7 +4384,41 @@ const float listX = mTargetX + 24.0f;
     return true;
   }
 
-  if (insideRect(x, y, listX, listY, listW, mTargetH - 168.0f)) {
+  if (insideRect(x, y, listX, listY, listW, listHeightFor())) {
+    // 行右端两个按钮：左边「收藏」（心形）、右边「下一首播放」（加号）。
+    // 只有真·歌曲行有，专辑/歌手/歌单卡片列表直接跳过。
+    // 行号换算必须与绘制同源，否则滚动之后会点错一行。
+    if (listShowsTracksLocked() && x >= listX + listW - 96.0f &&
+        x <= listX + listW - 6.0f) {
+      const int startRowN = std::max(0, static_cast<int>(mListScroll));
+      const float shiftN =
+          (mListScroll - static_cast<float>(startRowN)) * rowH;
+      const int rowN = static_cast<int>((y - listY + shiftN) / rowH);
+      const int idxN = startRowN + rowN;
+      const std::size_t listTotal =
+          (mQueueView == 1) ? mQueueTracks.size() : mTrackCount;
+      const bool hitFav = (x < listX + listW - 52.0f);
+      if (idxN >= 0 && static_cast<std::size_t>(idxN) < listTotal) {
+        if (hitFav) {
+          // 收藏：只切状态，不播放、不插队。
+          mPendingFavTrack.store(idxN);
+          mDirty = true;
+          __android_log_print(ANDROID_LOG_INFO, kTag,
+                              "行内收藏(点击): 行 %d tab=%d 队列=%d 总数=%zu",
+                              idxN, static_cast<int>(mTab), mQueueView,
+                              listTotal);
+        } else {
+          mPendingPlayNext.store(idxN);
+          setNoticeLocked("已加入下一首播放", 1600);
+          mDirty = true;
+          __android_log_print(ANDROID_LOG_INFO, kTag,
+                              "下一首播放(点击): 行 %d tab=%d 子页=%d 列表=%zu",
+                              idxN, static_cast<int>(mTab), mRecTab,
+                              mTrackCount);
+        }
+      }
+      return true;
+    }
     // 必须和绘制用同一套小数偏移：绘制是
     //   ry = listY + k*rowH - rowShift
     // 所以反过来求行号要加回 rowShift，否则列表滚动过之后整体错一行。
@@ -4172,7 +4437,10 @@ const float listX = mTargetX + 24.0f;
                         "偏移=%.1f 行=%d 曲目=%d 总数=%zu",
                         y, y - listY, rowH, startRow, rowShift, row, index,
                         mTrackCount);
-    if (index >= 0 && static_cast<std::size_t>(index) < mTrackCount) {
+    // 队列视图下点击的是播放队列，索引与引擎队列一致。
+    const std::size_t rowTotal =
+        (mQueueView == 1) ? mQueueTracks.size() : mTrackCount;
+    if (index >= 0 && static_cast<std::size_t>(index) < rowTotal) {
       mPendingIndex.store(index);
     }
     return true;
@@ -4198,7 +4466,8 @@ const float listX = mTargetX + 24.0f;
       return true;
     }
   }
-  return true;
+  // 面板内的空白处仍然消费：否则点在面板上的空白会漏给游戏，视角跟着转。
+  return inPanelArea(x, y);
 }
 
 HudUi::~HudUi() {
@@ -4507,9 +4776,23 @@ bool HudUi::submit() {
                             : (mTab == Tab::Mine) ? tr("我的", "Mine")
                             : (mTab == Tab::Favorites) ? tr("收藏", "Favorites")
                             : recSubNames[std::min(2, std::max(0, mRecTab))];
-    text(out, x + 24.0f, y + 14.0f, 26.0f * mFontScale, kTextMain, pageName);
+    // 专辑歌曲层：标题换成专辑名，让玩家知道自己停在哪一层。
+    // 用 marqueeFit 而不是 text，专辑名过长时会滚动，不会溢出面板。
+    if (mQueueView == 1) {
+      text(out, x + 24.0f, y + 14.0f, 26.0f * mFontScale, kTextMain,
+           tr("播放列表", "Playlist"));
+      // 队列视图下副标题单独显示首数，下面那段通用副标题会跳过。
+      text(out, x + 24.0f, y + 46.0f, 14.0f * mFontScale, kTextDim,
+           std::to_string(mQueueTracks.size()) + tr(" 首", " tracks"));
+    } else if (mTab == Tab::Search && mAlbumView == 1 &&
+               !mAlbumOpenName.empty()) {
+      marqueeFit(out, x + 24.0f, y + 14.0f, 26.0f * mFontScale,
+                 w - 300.0f, mAlbumOpenName, kTextMain, nowMs());
+    } else {
+      text(out, x + 24.0f, y + 14.0f, 26.0f * mFontScale, kTextMain, pageName);
+    }
     // 搜索页的副标题会与下方输入框（y+52）重叠，这一页不画。
-    if (mTab != Tab::Search) {
+    if (mTab != Tab::Search && mQueueView == 0) {
       text(out, x + 24.0f, y + 46.0f, 14.0f * mFontScale, kTextDim,
            (mTab == Tab::Mine) ? std::string("账号与设置")
            : (mTab == Tab::Favorites)
@@ -4797,11 +5080,11 @@ bool HudUi::submit() {
     const float listW = 540.0f;
     // 列表只在搜索页和推荐页绘制。「我的」页没有列表，
     // 原来无条件绘制，导致切到我的页时歌单和偏好按钮叠在一起。
-    const bool drawList = (mTab != Tab::Mine);
+    const bool drawList = (mTab != Tab::Mine) || (mQueueView == 1);
     // 行高按字号缩放：原来固定 54px，字号放大到 1.35 倍时
     // 标题(24px)+歌手(18px) 会挤在一起甚至重叠。
     const float rowH = std::max(54.0f, 40.0f * mFontScale);
-    const float listH = h - 104.0f - 64.0f;
+    const float listH = listHeightFor();
     // 行数向上取整，让最后一行能画出来，背景高度也对齐到整数行，
     // 否则最后一行下方会固定露出一条空白（原来是 588-540=48px）。
     const int maxRows = drawList ? static_cast<int>(listH / rowH) : 0;
@@ -4829,13 +5112,18 @@ bool HudUi::submit() {
       }
       // 行数按当前页取：各页的数据源不同，不能一律用 mTrackCount。
       std::size_t rowLimit = mTrackCount;
-      if (mTab == Tab::Favorites && mFavView == 0) {
+      if (mQueueView == 1) {
+        rowLimit = mQueueTracks.size();  // 播放队列侧栏
+      } else if (mTab == Tab::Favorites && mFavView == 0) {
         rowLimit = mFavPlaylists.size();
-      } else if (mArtistView == 1 && mArtistTab == 1) {
+      } else if (mTab == Tab::Search && mArtistView == 1 &&
+                 mArtistTab == 1 && mAlbumView == 0) {
         rowLimit = mArtistAlbums.size();
-      } else if (mTab == Tab::Search && mArtistView == 0 && mSearchKind == 1) {
+      } else if (mTab == Tab::Search && mArtistView == 0 && mAlbumView == 0 &&
+                 mSearchKind == 1) {
         rowLimit = mSearchAlbums.size();
-      } else if (mTab == Tab::Search && mArtistView == 0 && mSearchKind == 2) {
+      } else if (mTab == Tab::Search && mArtistView == 0 && mAlbumView == 0 &&
+                 mSearchKind == 2) {
         rowLimit = mSearchArtists.size();
       }
       if (static_cast<std::size_t>(i) >= rowLimit) {
@@ -4848,7 +5136,9 @@ bool HudUi::submit() {
         continue;
       }
       // 歌手页「专辑」子标签：画专辑卡片。
-      if (mArtistView == 1 && mArtistTab == 1) {
+      // 专辑歌曲层下必须让路，否则卡片会和歌曲列表叠在一起（穿模）。
+      if (mTab == Tab::Search && mArtistView == 1 && mArtistTab == 1 &&
+          mAlbumView == 0) {
         const int ai = startRow + k;
         if (ai < 0 ||
             static_cast<std::size_t>(ai) >= mArtistAlbums.size()) {
@@ -4874,7 +5164,8 @@ bool HudUi::submit() {
         continue;
       }
       // 搜索页「专辑」分类：同样画专辑卡片，数据来自 mSearchAlbums。
-      if (mTab == Tab::Search && mArtistView == 0 && mSearchKind == 1) {
+      if (mTab == Tab::Search && mArtistView == 0 && mAlbumView == 0 &&
+          mSearchKind == 1) {
         const int ai = startRow + k;
         if (ai < 0 ||
             static_cast<std::size_t>(ai) >= mSearchAlbums.size()) {
@@ -4903,7 +5194,8 @@ bool HudUi::submit() {
         continue;
       }
       // 搜索页「歌手」分类：画歌手卡片。
-      if (mTab == Tab::Search && mArtistView == 0 && mSearchKind == 2) {
+      if (mTab == Tab::Search && mArtistView == 0 && mAlbumView == 0 &&
+          mSearchKind == 2) {
         const int ai = startRow + k;
         if (ai < 0 ||
             static_cast<std::size_t>(ai) >= mSearchArtists.size()) {
@@ -5005,24 +5297,54 @@ bool HudUi::submit() {
       if (!rowWhole) {
         continue;
       }
-      const std::string &title =
-          (static_cast<std::size_t>(i) < mTrackTitles.size())
-              ? mTrackTitles[i]
-              : std::string("曲目");
+      // 队列视图的数据来自 mQueueTracks，其余视图来自 mTrackTitles。
+      std::string title;
+      std::string rowArtist;
+      if (mQueueView == 1) {
+        if (static_cast<std::size_t>(i) < mQueueTracks.size()) {
+          title = mQueueTracks[i].title;
+          rowArtist = mQueueTracks[i].artist;
+        }
+      } else {
+        if (static_cast<std::size_t>(i) < mTrackTitles.size()) {
+          title = mTrackTitles[i];
+        }
+        if (static_cast<std::size_t>(i) < mTrackArtists.size()) {
+          rowArtist = mTrackArtists[i];
+        }
+      }
+      if (title.empty()) {
+        title = "曲目";
+      }
       // 每行都画歌手，行高不再因选中而增减；标题上移 2 像素给副标题留位。
       // 纵向位置按字号算：字号 1.6 倍时 6/31 这两个固定偏移会挤在一起。
       const float titleY = ry + 5.0f * mFontScale;
       const float artistY = ry + rowH - 15.0f * mFontScale;
-      marqueeFit(out, listX + 22.0f, titleY, 18.0f * mFontScale,
-                 listW - 44.0f, title,
+      // 右侧留出 34px 给「下一首播放」图标，文字宽度相应收窄，
+      // 否则长标题会压到图标上。
+      const float textW =
+          listShowsTracksLocked() ? (listW - 118.0f) : (listW - 44.0f);
+      marqueeFit(out, listX + 22.0f, titleY, 18.0f * mFontScale, textW, title,
                  kTextMain, nowMs() + i * 350);
-      if (static_cast<std::size_t>(i) < mTrackArtists.size() &&
-          !mTrackArtists[i].empty()) {
+      if (!rowArtist.empty()) {
         // 原来用裸 text()，长歌手名会直接溢出列表区、盖到右侧播放区。
         // 改成 marqueeFit：放得下原样显示，放不下自动滚动，绝不越界。
-        marqueeFit(out, listX + 22.0f, artistY, 13.0f * mFontScale,
-                   listW - 44.0f, mTrackArtists[i],
-                   kTextDim, nowMs() + i * 350);
+        marqueeFit(out, listX + 22.0f, artistY, 13.0f * mFontScale, textW,
+                   rowArtist, kTextDim, nowMs() + i * 350);
+      }
+      // 行右端「下一首播放」：一个加号，不写文字。
+      // 加号比「三角+竖线」更直观地表达「加入队列」。
+      // 只在真·歌曲行画；专辑/歌手/歌单卡片列表没有这个键。
+      if (listShowsTracksLocked()) {
+        const float ncX = listX + listW - 30.0f;   // 下一首播放（加号）
+        const float favX = listX + listW - 70.0f;  // 收藏（心形）
+        const float ncY = ry + rowH * 0.5f;
+        // 收藏状态用实心/空心区分：实心 = 已在「我的收藏」里。
+        const bool fav = rowFavoritedLocked(static_cast<std::size_t>(i));
+        glyphHeart(out, favX, ncY, 17.0f, fav, fav ? kAccent : kTextDim);
+        // 十字两条：横 16x3，竖 3x16，中心对齐。
+        rect(out, ncX - 8.0f, ncY - 1.5f, 16.0f, 3.0f, kTextDim);
+        rect(out, ncX - 1.5f, ncY - 8.0f, 3.0f, 16.0f, kTextDim);
       }
     }
 
@@ -5061,9 +5383,19 @@ bool HudUi::submit() {
       }
     }
 
-    // 搜索输入框与确定键只在搜索页绘制。
+    // 专辑歌曲层：这一层没有搜索框，位置改画「返回 + 专辑名」。
+    // 不画搜索框是刻意的 —— 留着会让人以为还能在这里搜，
+    // 而实际搜索会跳出当前专辑。
     const float inputY = y + 52.0f;
-    if (mTab == Tab::Search) {
+    if (mTab == Tab::Search && mAlbumView == 1 && mQueueView == 0) {
+      roundRect(out, listX, inputY, 96.0f, 36.0f, kRadiusBtn, 0x33000000);
+      text(out, listX + 16.0f, inputY + 10.0f, 15.0f * mFontScale, kTextMain,
+           tr("返回", "Back"));
+      marqueeFit(out, listX + 110.0f, inputY + 10.0f, 16.0f * mFontScale,
+                 listW - 122.0f, mAlbumOpenName, kTextDim, nowMs());
+    }
+    // 搜索输入框与确定键只在搜索页、且不在专辑层/队列侧栏时绘制。
+    if (mTab == Tab::Search && mAlbumView == 0 && mQueueView == 0) {
     // 输入槽做成内凹：上面一条暗线、下面一条亮线，配上不透明的深色底。
     rect(out, listX, inputY, listW - 74.0f, 40.0f,
          mInputActive ? kFieldActive : kFieldBg);
@@ -5096,7 +5428,8 @@ bool HudUi::submit() {
     // 搜索页三分类标签：单曲 / 专辑 / 歌手。默认单曲。
     // 搜索框是空的时候不显示——什么都没搜，摆一排分类没有意义，
     // 而且会把列表区往下挤，看起来像「面板自己展开了一堆东西」。
-    if (mTab == Tab::Search && mArtistView == 0 && searchHasQuery()) {
+    if (mTab == Tab::Search && mArtistView == 0 && mAlbumView == 0 &&
+        mQueueView == 0 && searchHasQuery()) {
       const char *kinds[3] = {tr("单曲", "Songs"), tr("专辑", "Albums"),
                               tr("歌手", "Artists")};
       const float kindY = y + 96.0f;
@@ -5156,7 +5489,7 @@ bool HudUi::submit() {
     // 收藏页第二层的返回按钮。放左半边：
     // 位置在副标题下方、列表区上沿之上，不会和标题、头像、关闭键冲突。
     // 只在第二层（歌曲列表）出现；第一层是根层级，没有上级可返回。
-    if (mTab == Tab::Favorites && mFavView == 1) {
+    if (mTab == Tab::Favorites && mFavView == 1 && mQueueView == 0) {
       const float backX = listX;
       const float backY = y + 70.0f;
       rect(out, backX, backY, 96.0f, 28.0f, 0x33FFFFFF);
@@ -5178,6 +5511,7 @@ bool HudUi::submit() {
                              static_cast<int>(Tab::Favorites),
                              static_cast<int>(Tab::Mine)};
     const float tabY = y + h - 54.0f;
+    if (mQueueView == 0) {  // 队列视图独占左半边，这排入口整体不画
     const float tabW = listW / 4.0f;
     rect(out, listX, tabY - 4.0f, listW, 52.0f, 0x1C000000);
     rect(out, listX, tabY - 4.0f, listW, 1.0f, 0x16FFFFFF);
@@ -5194,6 +5528,7 @@ bool HudUi::submit() {
           estimateTextWidth(tabNames[ti], 17.0f * mFontScale);
       text(out, tx + (tabW - labelW) * 0.5f, tabY + 10.0f,
            17.0f * mFontScale, activeTab ? kTextMain : kTextDim, tabNames[ti]);
+    }
     }
 
     if (drawList) {  // 播放区与歌词只在搜索/推荐页绘制
@@ -5269,6 +5604,17 @@ bool HudUi::submit() {
         glyphModeRepeatOne(out, mcx, mcy, 30.0f, modeColor);
       } else {
         glyphModeSequential(out, mcx, mcy, 30.0f, modeColor);
+      }
+    }
+    // 播放队列按钮：三条杠，位于爱心右侧一格（infoX+390）。
+    // 打开时整块变成强调色，一眼能看出侧栏正在显示队列。
+    {
+      const float qx = infoX + 390.0f;
+      const float qy = y + 318.0f;
+      const std::uint32_t qc = (mQueueView == 1) ? kAccent : kTextMain;
+      for (int li = -1; li <= 1; ++li) {
+        rect(out, qx - 13.0f, qy + static_cast<float>(li) * 8.0f - 1.5f,
+             26.0f, 3.0f, qc);
       }
     }
     iconPrev(out, infoX + 30.0f, y + 318.0f, 34.0f, kTextMain);
@@ -5588,7 +5934,8 @@ bool HudUi::submit() {
     }
 
     // 推荐页顶部子分类只在展开页绘制。
-    if (mMode == Mode::Expanded && mTab == Tab::Recommend) {
+    if (mMode == Mode::Expanded && mTab == Tab::Recommend &&
+        mQueueView == 0) {
       rect(out, x + 24.0f, y + 46.0f, 540.0f, 56.0f, kSheetSoft);
       const char *recNames[3] = {"红心", "探索", "小众"};
       for (int i = 0; i < 3; ++i) {
@@ -5604,7 +5951,7 @@ bool HudUi::submit() {
       rect(out, x + 24.0f, y + 100.0f, 540.0f, 2.0f, 0x55FFFFFF);
     }
     // 我的：账号信息与推荐偏好。
-    if (mMode == Mode::Expanded && mTab == Tab::Mine) {
+    if (mMode == Mode::Expanded && mTab == Tab::Mine && mQueueView == 0) {
       // 这层铺底原来用不透明的 kSheet，把 glassPanel 的半透明底完全盖住，
       // 导致「我的」页调透明度毫无变化。改为跟随 mPanelAlpha。
       {
@@ -5665,6 +6012,20 @@ bool HudUi::submit() {
       cursor += upH + 10.0f;
       text(out, padX, cursor, 15.0f * mFontScale, kTextDim,
            "关闭后不再向酷狗同步播放记录");
+
+      // 关闭中面板：开启后单行条直接展开成大面板，跳过中间那一层。
+      cursor += 26.0f;
+      const float dmH = std::max(48.0f, 16.0f * mFontScale + 24.0f);
+      mMineDisableMiniY = cursor;
+      rect(out, padX, cursor, 300.0f, dmH,
+           mDisableMini ? 0xFF2F4C6E : kTrack);
+      text(out, padX + 20.0f, cursor + (dmH - 16.0f * mFontScale) * 0.5f,
+           16.0f * mFontScale, mDisableMini ? kAccent : kTextMain,
+           mDisableMini ? std::string("关闭中面板  开")
+                        : std::string("关闭中面板  关"));
+      cursor += dmH + 8.0f;
+      text(out, padX, cursor, 15.0f * mFontScale, kTextDim,
+           "开启后单行条直接展开为大面板，不再经过中面板");
 
       // ---- 右栏：三形态独立透明度 + 主题 ----
       // 三个形态分开设置，因为大小面板对透明度的接受度完全不同：
@@ -5861,14 +6222,31 @@ void HudUi::refresh(bool syncEngine) {
         }
       } else {
         // 列表由菜单缓存提供：只按曲目 id 找当前播放项，不用队列下标覆盖。
-        mTrackCount = mTrackIds.size();
         mCurrentIndex = static_cast<std::size_t>(-1);
         const Track *cur = mEngine->currentTrack();
-        if (cur != nullptr) {
-          for (std::size_t i = 0; i < mTrackIds.size(); ++i) {
-            if (mTrackIds[i] == cur->id) {
-              mCurrentIndex = i;
-              break;
+        if (mQueueView == 1) {
+          // 队列视图的数据源是 mQueueTracks，行数也必须用它。
+          // 原来这里统一用 mTrackIds（浏览列表的 id），队列里的歌一个都
+          // 匹配不上，mCurrentIndex 恒为 -1，表现就是「播放队列里正在
+          // 播放的那一行没有高亮」；同时行数被设成浏览列表长度，
+          // 队列比浏览列表长时，超出部分滚不出来。
+          mTrackCount = mQueueTracks.size();
+          if (cur != nullptr && !cur->id.empty()) {
+            for (std::size_t i = 0; i < mQueueTracks.size(); ++i) {
+              if (mQueueTracks[i].id == cur->id) {
+                mCurrentIndex = i;
+                break;
+              }
+            }
+          }
+        } else {
+          mTrackCount = mTrackIds.size();
+          if (cur != nullptr && !cur->id.empty()) {
+            for (std::size_t i = 0; i < mTrackIds.size(); ++i) {
+              if (mTrackIds[i] == cur->id) {
+                mCurrentIndex = i;
+                break;
+              }
             }
           }
         }
